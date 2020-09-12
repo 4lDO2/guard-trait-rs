@@ -25,6 +25,10 @@
 //! leaked at any time, and arrays allocated on the stack can also be dropped, when the memory is
 //! still in use by the kernel, as a buffer to write data from a socket into.
 //!
+//! Consider reading ["Mental experiments with
+//! `io_uring`"](https://vorner.github.io/2019/11/03/io-uring-mental-experiments.html), and ["Notes
+//! on `io_uring`"](https://without.boats/blog/io-uring/) for more information on this.
+//!
 //! # Interface
 //! 
 //! The main type that this crate provides, is the [`Guarded`] struct. [`Guarded`] is a wrapper
@@ -75,7 +79,7 @@ pub use stable_deref_trait::StableDeref;
 /// [`redox-iou`](https://gitlab.redox-os.org/redox-os/redox-iou), that associates a guarded piece
 /// of memory, with a future representing a pending submission and completion from a Redox
 /// `io_uring`. As the `io_uring` interface is zero-copy and allows the kernel (or another process,
-/// for redox) to use the memory that was part of the system call, until the completion
+/// for Redox) to use the memory that was part of the system call, until the completion
 // TODO: Investigate whether this is of use when it comes to concurrent memory reclamation, using
 // epochs (`crossbeam-epoch`) or hazard pointers (`conc`), and whether there can be integration
 // between those and this trait.
@@ -152,7 +156,7 @@ where
     guard: Option<G>,
     _marker: PhantomData<M>,
 }
-impl<G, T> Guarded<G, T>
+impl<G, T, M> Guarded<G, T, M>
 where
     G: Guard,
     T: ops::Deref,
@@ -170,6 +174,7 @@ where
         Self {
             inner: MaybeUninit::new(inner),
             guard: None,
+            _marker: PhantomData,
         }
     }
     /// Wrap a type into a wrapper that can be a new guarded, which prevents the inner value from
@@ -275,7 +280,7 @@ where
     /// that only read the buffer (e.g. _write(2)_), this is safe, however this depends on the
     /// context.
     pub unsafe fn get_unchecked_ref(&self) -> &<T as ops::Deref>::Target {
-        self.get_pointer_ref_unchecked().deref()
+        self.get_pointer_unchecked_ref().deref()
     }
     /// Attempt to obtain a shared reference to the inner data, returning None if a guard is
     /// present.
@@ -293,15 +298,24 @@ where
     where
         T: ops::DerefMut,
     {
-        unsafe { self.get_pointer_mut() }.deref_mut()
+        self.get_pointer_unchecked_mut().deref_mut()
     }
 
     /// Unsafely obtain a reference to the pointer encapsulated by this wrapper.
     ///
     /// This is safe because one of the [`StableDeref`] contracts, is that the pointer must not
     /// be able to change the address via a method that takes a shared reference (i.e. not `&mut`).
-    pub unsafe fn get_pointer_ref_unchecked(&self) -> &T {
-        unsafe { self.inner.assume_init_ref() }
+    pub unsafe fn get_pointer_unchecked_ref(&self) -> &T {
+        // TODO: #![feature(maybe_uninit_ref)]
+        //unsafe { self.inner.assume_init_ref() }
+        &*(&self.inner as *const MaybeUninit<T> as *const T)
+    }
+    pub fn try_get_pointer_ref(&self) -> Option<&T> {
+        if self.has_guard() {
+            return None;
+        }
+
+        Some(unsafe { self.get_pointer_unchecked_ref() })
     }
     /// Unsafely obtain a mutable reference to the pointer encapsulated by this wrapper.
     ///
@@ -310,11 +324,40 @@ where
     /// This method is unsafe because it allows the pointer to trivially change its inner address,
     /// for example when Vec reallocates its space to expand the collection, thus violating the
     /// `StableDeref` contract.
-    pub unsafe fn get_pointer_mut(&mut self) -> &mut T {
-        self.inner.assume_init_mut()
+    pub unsafe fn get_pointer_unchecked_mut(&mut self) -> &mut T {
+        // TODO: #![feature(maybe_uninit_ref)]
+        //self.inner.assume_init_mut()
+        &mut *(&mut self.inner as *mut MaybeUninit<T> as *mut T)
+    }
+    pub fn try_get_pointer_mut(&mut self) -> Option<&mut T> {
+        if self.has_guard() {
+            return None;
+        }
+        Some(unsafe { self.get_pointer_unchecked_mut() })
     }
 }
-impl<G, T> fmt::Debug for Guarded<G, T>
+impl<G, T> Guarded<G, T, ReadOnly>
+where
+    G: Guard,
+    T: ops::Deref,
+{
+    /// Obtain a reference to the pointer.
+    pub fn get_pointer_ref(&self) -> &T {
+        // SAFETY: This is safe since the ReadOnly mode implies that the memory protected by this
+        // guard cannot be written to by the external actor. Since the constructor for this type
+        // requires the address to be stable, and not modified unless via a "&mut" method,
+        // retrieving the pointer in this case is harmless.
+        unsafe { self.get_pointer_unchecked_ref() }
+    }
+
+    /// Obtain a reference to the pointee.
+    pub fn get_ref(&self) -> &<T as ops::Deref>::Target {
+        // SAFETY: As with get_pointer_ref, this is safe since the wrapper is marked ReadOnly, and
+        // the address is already assumed to be stable.
+        unsafe { self.get_unchecked_ref() }
+    }
+}
+impl<G, T, M> fmt::Debug for Guarded<G, T, M>
 where
     G: Guard,
     T: ops::Deref + fmt::Debug,
@@ -344,16 +387,18 @@ where
         }
 
         f.debug_struct("Guarded")
+            .field("mode", &core::any::type_name::<M>())
             .field("value", &*self)
             .field("guard", &GuardDbg(self.guard.as_ref()))
             .finish()
     }
 }
 
-pub enum Exclusive {}
-pub enum Sharable {}
+pub enum WriteOnly {}
+pub enum ReadOnly {}
+pub enum ReadWrite {}
 
-impl<G, T> Drop for Guarded<G, T>
+impl<G, T, M> Drop for Guarded<G, T, M>
 where
     G: Guard,
     T: ops::Deref,
@@ -363,11 +408,11 @@ where
             // Drop the inner value if the guard was able to be removed.
             drop(unsafe { self.uninitialize_inner() })
         } else {
-            // No nothing and leak the value otherwise.
+            // Do nothing and leak the value otherwise.
         }
     }
 }
-impl<G, T> ops::Deref for Guarded<G, T>
+impl<G, T> ops::Deref for Guarded<G, T, ReadOnly>
 where
     G: Guard,
     T: ops::Deref,
@@ -375,39 +420,20 @@ where
     type Target = <T as ops::Deref>::Target;
 
     fn deref(&self) -> &Self::Target {
-        unsafe { self.inner.get_ref() }
+        self.get_ref()
     }
 }
-impl<G, T> ops::DerefMut for Guarded<G, T>
-where
-    G: Guard,
-    T: ops::Deref + ops::DerefMut,
-{
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        unsafe { self.inner.get_mut() }
-    }
-}
-impl<G, T, U> AsRef<U> for Guarded<G, T>
+impl<G, T, U> AsRef<U> for Guarded<G, T, ReadOnly>
 where
     G: Guard,
     T: ops::Deref<Target = U>,
     U: ?Sized,
 {
     fn as_ref(&self) -> &U {
-        &*self
+        self.get_ref()
     }
 }
-impl<G, T, U> AsMut<U> for Guarded<G, T>
-where
-    G: Guard,
-    T: ops::Deref<Target = U> + ops::DerefMut,
-    U: ?Sized,
-{
-    fn as_mut(&mut self) -> &mut U {
-        &mut *self
-    }
-}
-impl<G, T> From<T> for Guarded<G, T>
+impl<G, T, M> From<T> for Guarded<G, T, M>
 where
     G: Guard,
     T: ops::Deref + StableDeref + 'static,
@@ -416,7 +442,7 @@ where
         Self::new(inner)
     }
 }
-unsafe impl<G, T> StableDeref for Guarded<G, T>
+unsafe impl<G, T> StableDeref for Guarded<G, T, ReadOnly>
 where
     G: Guard,
     T: ops::Deref,
@@ -439,7 +465,7 @@ where
 ///   guardable is leaked, the data must no longer be accessible (this rules out data on the stack).
 ///
 /// [`try_guard`]: #method.try_guard
-pub unsafe trait Guardable<G>: ops::Deref {
+pub unsafe trait Guardable<G> {
     /// Attempt to insert a guard into the guardable, if there wasn't already a guard inserted. If
     /// that were the case, error with the guard that wasn't able to be inserted.
     ///
@@ -448,7 +474,7 @@ pub unsafe trait Guardable<G>: ops::Deref {
     fn try_guard(&mut self, guard: G) -> Result<(), G>;
 }
 
-unsafe impl<G, T> Guardable<G> for Guarded<G, T>
+unsafe impl<G, T, M> Guardable<G> for Guarded<G, T, M>
 where
     G: Guard,
     T: StableDeref + 'static + ops::Deref,
@@ -493,6 +519,6 @@ mod tests {
     #[test]
     fn safely_create_guarded_to_static_ref() {
         let static_ref: &'static [u8] = &STATIC_DATA;
-        let _ = Guarded::<NoGuard, _>::new(static_ref);
+        let _ = Guarded::<NoGuard, _, ReadOnly>::new(static_ref);
     }
 }
