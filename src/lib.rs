@@ -123,7 +123,7 @@
 //! process or hardware, that has no knowledge of when the buffer is getting reclaimed.__
 
 #![cfg_attr(not(any(test, feature = "std")), no_std)]
-//#![feature(maybe_uninit_ref)]
+#![cfg_attr(feature = "nightly", feature(maybe_uninit_ref, maybe_uninit_extra))]
 
 use core::mem::MaybeUninit;
 use core::marker::PhantomData;
@@ -364,8 +364,15 @@ where
         }
     }
     unsafe fn uninitialize_inner(&mut self) -> T {
-        // self.inner.read() - TODO: use this when #![feature(maybe_uninit_extra)]
-        mem::replace(&mut self.inner, MaybeUninit::uninit()).assume_init()
+        // TODO: always use this when #![feature(maybe_uninit_extra)] is stabilized.
+        #[cfg(feature = "nightly")]
+        {
+            self.inner.assume_init_read()
+        }
+        #[cfg(not(feature = "nightly"))]
+        {
+            mem::replace(&mut self.inner, MaybeUninit::uninit()).assume_init()
+        }
     }
     /// Obtain a reference to the pointee of the value protected by this guard.
     ///
@@ -458,9 +465,15 @@ where
     /// pointer must not be changeable the address via a method that takes a shared reference (i.e.
     /// not `&mut`).
     pub unsafe fn get_pointer_unchecked_ref(&self) -> &T {
-        // TODO: #![feature(maybe_uninit_ref)]
-        //unsafe { self.inner.assume_init_ref() }
-        &*(&self.inner as *const MaybeUninit<T> as *const T)
+        // TODO: use this by default once #![feature(maybe_uninit_ref)] is stabilized.
+        #[cfg(feature = "nightly")]
+        {
+            self.inner.assume_init_ref()
+        }
+        #[cfg(not(feature = "nightly"))]
+        {
+            &*(&self.inner as *const MaybeUninit<T> as *const T)
+        }
     }
     /// Try to get a reference to the pointer encapsulated by this wrapper, unless there is a
     /// guard.
@@ -486,9 +499,17 @@ where
     /// change its inner address, for example when Vec reallocates its space to expand the
     /// collection.
     pub unsafe fn get_pointer_unchecked_mut(&mut self) -> &mut T {
-        // TODO: #![feature(maybe_uninit_ref)]
-        //self.inner.assume_init_mut()
-        &mut *(&mut self.inner as *mut MaybeUninit<T> as *mut T)
+        // TODO: move this from the nightly feature flag to the default once
+        // #![feature(maybe_uninit_ref)] is stabilized.
+
+        #[cfg(feature = "nightly")]
+        {
+            self.inner.assume_init_mut()
+        }
+        #[cfg(not(feature = "nightly"))]
+        {
+            &mut *(&mut self.inner as *mut MaybeUninit<T> as *mut T)
+        }
     }
     /// Try to attain a mutable reference to the inner data, failing if there is a guard allowing
     /// the data to be accessed by the kernel.
