@@ -556,7 +556,7 @@ where
                     Some(_) => write!(
                         f,
                         "[guarded using guard type `{}`]",
-                        std::any::type_name::<H>()
+                        core::any::type_name::<H>()
                     ),
                     None => write!(f, "[no guard]"),
                 }
