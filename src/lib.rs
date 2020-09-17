@@ -12,43 +12,99 @@
 //!
 //! However, for more advanced asynchronous interfaces such as `io_uring` that never copy memory,
 //! the memory can still be used once the system call has started, which can lead to data races
-//! between two actors sharing memory. This is possible if an old memory range that the other actor
-//! still thinks it can use, is then used for different purpose by this process. Additionally,
-//! although being a niche case, this can also be used for safe wrappers protecting memory for DMA
-//! in device drivers, with a few additional restrictions to make that work.
+//! between two actors sharing memory. To prevent this data race, it is not possible to:
 //!
-//! This does unfortunately not play very well with the current asynchronous ecosystem, where
-//! almost all I/O is done using regular slices, and references are merely borrows which are
-//! cancellable _at any time_, even by leaking. So, a future that locally stores an array, which is
-//! aliased by the kernel in `io_uring`, cannot stop the kernel from using the memory again in any
-//! reasonable way, without blocking indefinitely. What is even worse, is that futures can be
-//! leaked at any time, and arrays allocated on the stack can also be dropped, when the memory is
-//! still in use by the kernel, as a buffer to write data from a socket into.
+//! 1) Read the memory while it is being written to by the kernel, or write to the memory while it
+//!    is being read by the kernel. This is exactly like Rust's aliasing rules: we can either allow
+//!    both the kernel and this process to read a buffer, for example in the system call
+//!    _write(2)_, we can temporarily give the kernel exclusive ownership one or more buffers when
+//!    the kernel is going to write to them, or we can avoid sharing memory at all with the kernel,
+//!    __but we cannot let either actor have mutable access while the other has any access at
+//!    all.__
+//! 2) Reclaim the memory while it is being read from or written to by the kernel. This is as
+//!    simple as it sounds: we simply do not want the buffers to be used for other purposes, either
+//!    by returning the memory to the heap, where it can be allocated simply so that the kernel can
+//!    overwrite it when it is not supposed to, or it can corrupt stack variables.
+//!
+//! The term "kernel" does not necessarily have to be the other actor that the memory is shared
+//! with; on Redox for example, the `io_uring` interface can work solely between regular userspace
+//! processes. Additionally, although being a somewhat niche case, this can also be used for safe
+//! wrappers protecting memory for DMA in device drivers, with a few additional restrictions
+//! (regarding cache coherency) to make that work.
+//!
+//! This buffer sharing logic does unfortunately not play very well with the current asynchronous
+//! ecosystem, where almost all I/O is done using regular borrowed slices, and references are
+//! merely borrows which are cancellable _at any time_, even by leaking. This functions perfectly
+//! when you use _synchronous_ (but non-blocking) system calls where either the process or the
+//! kernel can execute at a time. In contrast, `io_uring` is _asynchronous_, meaning that the
+//! kernel can read and write to buffers, _while our program is executing_. Therefore, a future
+//! that locally stores an array, aliased by the kernel in `io_uring`, cannot stop the kernel from
+//! using the memory again in any reasonable way, if the future were to be `Drop`ped, without
+//! blocking indefinitely. What is even worse, is that futures can be leaked at any time, and
+//! arrays allocated on the stack can also be dropped, when the memory is still in use by the
+//! kernel, as a buffer to write data from e.g. a socket. If a (mutable) buffer of a stack is then
+//! used for regular variables... arbitrary program corruption!
+//!
+//! What we need in order to solve these two complications, is some way to be able to mark a memory
+//! region as both "borrowed by the kernel" (mutably or immutably), and "undroppable". Since the
+//! Rust borrow checker is smart, any mutable reference with a lifetime that is shorter than
+//! `'static`, can trivially be leaked, and the pointer can be used again. This rules out any
+//! reference of lifetime `'a` that `'static` outlives, as those may be used again outside of the
+//! borrow, potentially mutably. Immutable static references are however completely harmless, since
+//! they cannot be dropped nor accessed mutably, and immutable aliasing is always permitted.
+//!
+//! Consequently, all buffers that are going to be used in safe code, must be owned. This either
+//! means heap-allocated objects (since we can assume that the heap as a whole has the `'static`
+//! lifetime, and allocations stay forever, until deallocated explicitly), buffer pools which
+//! themselves have a guarding mechanism, and static references (both mutable and immutable). We
+//! can however allow borrowed data as well, but because of the semantics around lifetimes, and the
+//! very fact that the compiler has no idea that the kernel is also involved, that requires unsafe
+//! code.
 //!
 //! Consider reading ["Mental experiments with
 //! `io_uring`"](https://vorner.github.io/2019/11/03/io-uring-mental-experiments.html), and ["Notes
-//! on `io_uring`"](https://without.boats/blog/io-uring/) for more information on this.
+//! on `io_uring`"](https://without.boats/blog/io-uring/) for more information about these
+//! challenges.
 //!
 //! # Interface
 //! 
 //! The main type that this crate provides, is the [`Guarded`] struct. [`Guarded`] is a wrapper
-//! that encapsulates any stable pointer (anything that implements [`StableDeref`]), and does not
-//! allow dropping, until the guard successfully returns `true` in [`Guard::try_release`]. There
-//! exists a fallible reclamation method as well, and the Drop impl will leak the memory entirely,
-//! if the guard was not able to release the memory at that point.
+//! that encapsulates any stable pointer (which in safe code, can only be done for types that
+//! implement [`StableDeref`]). The reason for [`StableDeref`] is because the memory must point to
+//! the same buffer, and be independent of the location of the _pointer_ on the stack. Due to this,
+//! a newtype that simply borrows an inner field cannot safely be stored in the [`Guarded`]
+//! wrapper, but heap containers such as [`std::vec::Vec`] and [`std::boxed::Box`] implement that
+//! trait.
 //!
-//! There are a few corner-cases to this: for example, static references are guaranteed to never be
-//! dropped (at least in Safe Rust), which also includes things like string literals and other
-//! static data. To make APIs more ergonomic, there is also a trait for types that can trivially be
-//! moved out from a guard, because they can never be reclaimed, and are always valid. For this,
-//! there exists a trait [`Unguard`], that is only implemented for static references pointing to
-//! static data. Types that implement [`Unguard`] can always safely be moved out from [`Guarded`],
-//! without needing the guard to agree.
+//! Once the wrapper is populated with an active guard, which typically happens when an `io_uring`
+//! opcode is submitted, that will access memory, the wrapper will neither allow merely accessing
+//! the memory, nor dropping it, until the guard successfully returns `true` when calling
+//! [`Guard::try_release`]. It is then the responsibility of the guard, to make sure dynamically,
+//! that the memory is no longer aliased. There exist a fallible reclamation method , and a method
+//! for trying to access the memory as well, which will succeed if the guard is either nonpresent,
+//! or if [`Guard::try_release`] succeeds. The Drop impl will leak the memory entirely (by not
+//! calling the `Drop` handler of the inner value), if the guard was not able to release the memory
+//! when the buffer goes out of scope. It is thus highly advised to manually keep track of the
+//! buffer, to prevent accidental leakage.
+//!
+//  /*
+//  There are a few corner-cases to these quite strict rules: for example, static references are
+//  guaranteed to never be dropped (at least in Safe Rust), which also includes things like string
+//  literals and other static data. To make APIs more ergonomic, there is also a trait for types
+//  that can trivially be moved out from a guard, because they can never be reclaimed nor written
+//  to (in the case of immutable static references), and are
+//  always valid. For this, there exists a trait [`Unguard`], that is only implemented for static
+//  references pointing to static data. Types that implement [`Unguard`] can always safely be moved
+//  out from [`Guarded`], without needing the guard to agree.
+//  */
 //!
 //! Additionally, there exist some types that handle their guarding mechanism themselves. The
-//! [`Guardable`] trait exists for this, which represents types that can insert a guard, and follow
-//! the same rules as [`Guarded`]. __Because of this, prefer `impl Guardable` rather than
-//! [`Guarded`], if possible. This trait is implemented by [`Guarded`], and the most notable
+//! regular [`Guarded`] wrapper assumes that all data comes from the heap, or some other global
+//! location that persists for the duration of the program, but is suboptimal for custom allocators
+//! e.g. in buffer pools. To address this limitation, the [`Guardable`] trait exists to abstracts the role of
+//! what the [`Guarded`] wrapper does, namely being able to insert a guard, protect the memory
+//! until the guard can be released. For flexibilility, __prefer `impl Guardable` rather than
+//! [`Guarded`], if possible__. This trait is implemented by [`Guarded`], and the most notable
 //! example outside of this crate is `BufferSlice` from
 //! [`redox-buffer-pool`](https://gitlab.redox-os.org/redox-os/redox-buffer-pool), that needs to
 //! tell the buffer pool that the pool has guarded memory, to prevent it from deallocating that
@@ -95,7 +151,7 @@ pub trait Guard {
 }
 
 /// A no-op guard, that cannot be initialized but still useful in type contexts. This the
-/// recommended placeholder for types that do not need guarding, i.e. [`Unguard`] types.
+/// recommended placeholder for types that do not need guarding.
 ///
 /// This will be replaced with the never type, once that is stabilized.
 #[derive(Debug)]
@@ -301,6 +357,33 @@ where
         self.get_pointer_unchecked_mut().deref_mut()
     }
 
+    pub fn try_get_mut(&mut self) -> Option<&mut <T as ops::Deref>::Target>
+    where
+        T: ops::DerefMut,
+    {
+        if self.has_guard() {
+            return None;
+        }
+
+        Some(unsafe { self.get_unchecked_mut() })
+    }
+
+    pub fn as_ptr(&self) -> *const <T as ops::Deref>::Target {
+        unsafe { self.get_unchecked_ref() }
+    }
+    pub fn as_mut_ptr(&mut self) -> *mut <T as ops::Deref>::Target
+    where
+        T: ops::DerefMut,
+    {
+        unsafe { self.get_unchecked_mut() }
+    }
+    pub fn as_pointer_ptr(&self) -> *const T {
+        unsafe { self.get_pointer_unchecked_ref() }
+    }
+    pub fn as_mut_pointer_ptr(&mut self) -> *mut T {
+        unsafe { self.get_pointer_unchecked_mut() }
+    }
+
     /// Unsafely obtain a reference to the pointer encapsulated by this wrapper.
     ///
     /// This is safe because one of the [`StableDeref`] contracts, is that the pointer must not
@@ -484,28 +567,6 @@ where
             return Err(guard);
         }
         Self::guard(self, guard);
-        Ok(())
-    }
-}
-
-pub unsafe trait Unguard: ops::Deref {}
-
-// The following implementations exist because a static reference which pointee also is static,
-// cannot be dropped at all.
-unsafe impl<T> Unguard for &'static T
-where
-    T: 'static + ?Sized,
-{}
-unsafe impl<T> Unguard for &'static mut T
-where
-    T: 'static + ?Sized,
-{}
-
-unsafe impl<G, T> Guardable<G> for T
-where
-    T: ops::Deref + ?Sized + Unguard,
-{
-    fn try_guard(&mut self, _guard: G) -> Result<(), G> {
         Ok(())
     }
 }
