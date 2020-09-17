@@ -20,11 +20,12 @@
 //!    _write(2)_, we can temporarily give the kernel exclusive ownership one or more buffers when
 //!    the kernel is going to write to them, or we can avoid sharing memory at all with the kernel,
 //!    __but we cannot let either actor have mutable access while the other has any access at
-//!    all.__
+//!    all.__ (_aliasing invariant_)
 //! 2) Reclaim the memory while it is being read from or written to by the kernel. This is as
 //!    simple as it sounds: we simply do not want the buffers to be used for other purposes, either
 //!    by returning the memory to the heap, where it can be allocated simply so that the kernel can
-//!    overwrite it when it is not supposed to, or it can corrupt stack variables.
+//!    overwrite it when it is not supposed to, or it can corrupt stack variables. (_reclamation
+//!    invariant_)
 //!
 //! The term "kernel" does not necessarily have to be the other actor that the memory is shared
 //! with; on Redox for example, the `io_uring` interface can work solely between regular userspace
@@ -134,20 +135,28 @@ pub use stable_deref_trait::StableDeref;
 pub mod marker {
     /// A marker for memory regions that cannot be mutated, and thus lift the memory accessibility
     /// restriction, and only require safe memory reclamation.
-    pub struct Shared {
-        _not_creatable: (),
-    }
+    pub enum Shared {}
     /// A marker for memory regions that _may_ be mutated, and hence require exclusive access.
     /// Using this marker, the [`Guarded`] wrapper will forbid simply accessing the memory, until
     /// the guard is released.
-    pub struct Exclusive {
-        _not_creatable: (),
+    pub enum Exclusive {}
+
+    /// The "borrow mode" that the kernel will use when using the memory region. This can only be 
+    pub trait Mode: private::Sealed {
+        const IS_ALIASABLE: bool;
     }
 
     mod private {
-        pub trait Aliasable {}
+        pub trait Sealed {}
     }
-    impl private::Aliasable for Shared {}
+    impl private::Sealed for Shared {}
+    impl private::Sealed for Exclusive {}
+    impl Mode for Shared {
+        const IS_ALIASABLE: bool = true;
+    }
+    impl Mode for Exclusive {
+        const IS_ALIASABLE: bool = false;
+    }
 }
 
 /// A trait for guards, that decide whether memory can be deallocated, or whether it may be shared
@@ -237,6 +246,7 @@ pub struct Guarded<G, T, M>
 where
     G: Guard,
     T: ops::Deref,
+    M: marker::Mode,
 {
     // TODO: Allow layout optimization by not using MaybeUninit.
     inner: MaybeUninit<T>,
@@ -247,6 +257,7 @@ impl<G, T, M> Guarded<G, T, M>
 where
     G: Guard,
     T: ops::Deref,
+    M: marker::Mode,
 {
     /// Wrap a type into a wrapper that can be a new guarded, which prevents the inner value from
     /// dropping or being moved out safely, until the guard releases itself.
@@ -374,9 +385,13 @@ where
         self.get_pointer_unchecked_ref().deref()
     }
     /// Attempt to obtain a shared reference to the inner data, returning None if a guard is
-    /// present.
+    /// present and `M` is [`marker::Exclusive`].
+    ///
+    /// NOTE: If the generic parameter `M` is [`marker::Shared`], then this will never fail, since
+    /// the kernel is not allowed to write to the memory simultaneously. If it can be guaranteed at
+    /// the type level that this is the case, it is preferable to use [`get_ref`] in lieu.
     pub fn try_get_ref(&self) -> Option<&<T as ops::Deref>::Target> {
-        if self.has_guard() {
+        if !M::IS_ALIASABLE && self.has_guard() {
             return None;
         }
 
@@ -384,7 +399,9 @@ where
     }
     /// Obtain a mutable reference to the pointee of the value protected by this guard.
     ///
-    /// See [`get_ref`] for a more detailed explanation of the guarantees of this method.
+    /// # Safety
+    ///
+    /// See [`get_ref`] for a more detailed explanation of the required invariants for this method.
     pub unsafe fn get_unchecked_mut(&mut self) -> &mut <T as ops::Deref>::Target
     where
         T: ops::DerefMut,
@@ -392,6 +409,11 @@ where
         self.get_pointer_unchecked_mut().deref_mut()
     }
 
+    /// Attempt to obtain an exclusive reference to the inner data, returning None if a guard is
+    /// present.
+    ///
+    /// Unlike [`try_get_ref`], there is never a case when shared memory can be accessed mutably,
+    /// and thus this will only succeed if there is no guard present.
     pub fn try_get_mut(&mut self) -> Option<&mut <T as ops::Deref>::Target>
     where
         T: ops::DerefMut,
@@ -403,33 +425,49 @@ where
         Some(unsafe { self.get_unchecked_mut() })
     }
 
+    /// Borrow the pointee as a `*const` pointer.
     pub fn as_ptr(&self) -> *const <T as ops::Deref>::Target {
         unsafe { self.get_unchecked_ref() }
     }
+    /// Borrow the pointee a `*mut` pointer.
     pub fn as_mut_ptr(&mut self) -> *mut <T as ops::Deref>::Target
     where
         T: ops::DerefMut,
     {
         unsafe { self.get_unchecked_mut() }
     }
+    /// Borrow the pointer as a `*const` pointer.
     pub fn as_pointer_ptr(&self) -> *const T {
         unsafe { self.get_pointer_unchecked_ref() }
     }
+    /// Borrow the pointer as a `*mut` pointer;
     pub fn as_mut_pointer_ptr(&mut self) -> *mut T {
         unsafe { self.get_pointer_unchecked_mut() }
     }
 
     /// Unsafely obtain a reference to the pointer encapsulated by this wrapper.
     ///
-    /// This is safe because one of the [`StableDeref`] contracts, is that the pointer must not
-    /// be able to change the address via a method that takes a shared reference (i.e. not `&mut`).
+    /// # Safety
+    ///
+    /// This is unsafe only because a pointer can obviously dereference into the pointee, which is
+    /// not allowed if the guard is active, and `M` is [`marker::Exclusive`]. This method will not
+    /// check for the guard. If it is known that `M` is [`marker::Shared`] on the other hand,
+    /// prefer the safer [`get_pointer_ref`].
+    ///
+    /// This cannot violate any invariant required by [`StableDeref`], since it requires that the
+    /// pointer must not be changeable the address via a method that takes a shared reference (i.e.
+    /// not `&mut`).
     pub unsafe fn get_pointer_unchecked_ref(&self) -> &T {
         // TODO: #![feature(maybe_uninit_ref)]
         //unsafe { self.inner.assume_init_ref() }
         &*(&self.inner as *const MaybeUninit<T> as *const T)
     }
+    /// Try to get a reference to the pointer encapsulated by this wrapper, unless there is a
+    /// guard.
+    ///
+    /// Prefer [`get_pointer_ref`] if it is known that `M` is [`marker::Shared`].
     pub fn try_get_pointer_ref(&self) -> Option<&T> {
-        if self.has_guard() {
+        if !M::IS_ALIASABLE && self.has_guard() {
             return None;
         }
 
@@ -439,14 +477,21 @@ where
     ///
     /// # Safety
     ///
-    /// This method is unsafe because it allows the pointer to trivially change its inner address,
-    /// for example when Vec reallocates its space to expand the collection, thus violating the
-    /// `StableDeref` contract.
+    /// The main safety prerequisite of calling this method, is that there must not be an active
+    /// guard, which allows the kernel to either access immutably or mutably, when present. If
+    /// there is, then the protection that the guard offers in the context where it is used, must
+    /// be applied similarly by the caller.
+    ///
+    /// This can violate the [`StableDeref`], as calling this allows the pointer to then trivially
+    /// change its inner address, for example when Vec reallocates its space to expand the
+    /// collection.
     pub unsafe fn get_pointer_unchecked_mut(&mut self) -> &mut T {
         // TODO: #![feature(maybe_uninit_ref)]
         //self.inner.assume_init_mut()
         &mut *(&mut self.inner as *mut MaybeUninit<T> as *mut T)
     }
+    /// Try to attain a mutable reference to the inner data, failing if there is a guard allowing
+    /// the data to be accessed by the kernel.
     pub fn try_get_pointer_mut(&mut self) -> Option<&mut T> {
         if self.has_guard() {
             return None;
@@ -479,6 +524,7 @@ impl<G, T, M> fmt::Debug for Guarded<G, T, M>
 where
     G: Guard,
     T: ops::Deref + fmt::Debug,
+    M: marker::Mode,
 {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         struct GuardDbg<'a, H>(Option<&'a H>);
@@ -516,6 +562,7 @@ impl<G, T, M> Drop for Guarded<G, T, M>
 where
     G: Guard,
     T: ops::Deref,
+    M: marker::Mode,
 {
     fn drop(&mut self) {
         if self.try_unguard().is_ok() {
@@ -551,6 +598,7 @@ impl<G, T, M> From<T> for Guarded<G, T, M>
 where
     G: Guard,
     T: ops::Deref + StableDeref + 'static,
+    M: marker::Mode,
 {
     fn from(inner: T) -> Self {
         Self::new(inner)
@@ -593,6 +641,7 @@ unsafe impl<G, T, M> Guardable<G> for Guarded<G, T, M>
 where
     G: Guard,
     T: ops::Deref,
+    M: marker::Mode,
 {
     fn try_guard(&mut self, guard: G) -> Result<(), G> {
         if self.has_guard() {
