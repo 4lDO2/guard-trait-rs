@@ -201,6 +201,8 @@ impl Guard for NoGuard {
     }
 }
 
+/// The error returned from [`Guarded::try_unguard`] if the guard could not release the memory
+/// region.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct TryUnguardError;
 
@@ -533,6 +535,15 @@ where
         }
         Some(unsafe { self.get_pointer_unchecked_mut() })
     }
+
+    /// Get a reference to the guard, if present.
+    pub fn guard_ref(&self) -> Option<&G> {
+        self.guard.as_ref()
+    }
+    /// Get a mutable reference to the guard, if present.
+    pub fn guard_mut(&mut self) -> Option<&mut G> {
+        self.guard.as_mut()
+    }
 }
 impl<G, T> Guarded<G, T, marker::Shared>
 where
@@ -699,8 +710,58 @@ mod tests {
 
     // TODO
 
-    /*#[test]
+    #[test]
     fn mutable_static_ref() {
         let static_ref_mut: &'static mut [u8] = Box::leak(STATIC_DATA.to_vec().into_boxed_slice());
-    }*/
+
+        #[derive(Debug, Eq, PartialEq)]
+        struct MyGuard(bool);
+
+        impl Guard for MyGuard {
+            fn try_release(&self) -> bool {
+                self.0
+            }
+        }
+
+        let ptr: *mut _ = static_ref_mut;
+
+        let mut copy = STATIC_DATA;
+
+        let mut guarded = Guarded::<MyGuard, _, marker::Shared>::new(static_ref_mut);
+
+        assert_eq!(guarded.try_get_ref(), Some(&copy[..]));
+        assert_eq!(guarded.get_ref(), &copy[..]);
+        assert_eq!(guarded.get_pointer_ref(), &&copy[..]);
+
+        assert_eq!(guarded.try_get_pointer_ref(), Some(&&mut copy[..]));
+        assert_eq!(guarded.try_get_mut(), Some(&mut copy[..]));
+        // TODO: try_get_pointer_mut: it's just a headache with the lifetimes there
+
+        assert_eq!(guarded.as_ptr(), ptr);
+        assert_eq!(guarded.as_mut_ptr(), ptr);
+        assert_ne!(guarded.as_pointer_ptr(), ptr as *const _);
+        assert_ne!(guarded.as_mut_pointer_ptr(), ptr as *mut _);
+        assert!(!guarded.has_guard());
+
+        guarded.guard(MyGuard(false));
+
+        assert_eq!(guarded.get_ref(), &copy[..]);
+        assert_eq!(guarded.try_get_ref(), Some(&copy[..]));
+        assert_eq!(guarded.try_get_pointer_ref(), Some(&&mut copy[..]));
+        assert_eq!(guarded.get_pointer_ref(), &&copy[..]);
+
+        // NOTE: After the guard, the following must fail.
+        assert_eq!(guarded.try_get_mut(), None);
+        assert_eq!(guarded.try_get_pointer_mut(), None);
+
+        assert_eq!(guarded.as_ptr(), ptr);
+        assert_eq!(guarded.as_mut_ptr(), ptr);
+        assert_ne!(guarded.as_pointer_ptr(), ptr as *const _);
+        assert_ne!(guarded.as_mut_pointer_ptr(), ptr as *mut _);
+
+        assert_eq!(guarded.try_unguard(), Err(TryUnguardError));
+        guarded.guard_mut().unwrap().0 = true;
+        assert_eq!(guarded.try_unguard(), Ok(Some(MyGuard(true))));
+        assert_eq!(guarded.try_unguard(), Ok(None));
+    }
 }
