@@ -697,8 +697,10 @@ mod tests {
         let _ = Guarded::<NoGuard, _, marker::Shared>::new(static_ref);
     }
 
-    #[test]
+    // TODO
+
+    /*#[test]
     fn mutable_static_ref() {
         let static_ref_mut: &'static mut [u8] = Box::leak(STATIC_DATA.to_vec().into_boxed_slice());
-    }
+    }*/
 }
