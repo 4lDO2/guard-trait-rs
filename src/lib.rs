@@ -63,7 +63,7 @@
 //!
 //! Consider reading ["Mental experiments with
 //! `io_uring`"](https://vorner.github.io/2019/11/03/io-uring-mental-experiments.html), and ["Notes
-//! on `io_uring`"](https://without.boats/blog/io-uring/) for more information about these
+//! on `io-uring`"](https://without.boats/blog/io-uring/) for more information about these
 //! challenges.
 //!
 //! # Interface
@@ -78,45 +78,48 @@
 //!
 //! Once the wrapper is populated with an active guard, which typically happens when an `io_uring`
 //! opcode is submitted, that will access memory, the wrapper will neither allow merely accessing
-//! the memory, nor dropping it, until the guard successfully returns `true` when calling
-//! [`Guard::try_release`]. It is then the responsibility of the guard, to make sure dynamically,
-//! that the memory is no longer aliased. There exist a fallible reclamation method , and a method
-//! for trying to access the memory as well, which will succeed if the guard is either nonpresent,
+//! the memory, nor dropping it, until the guard successfully returns `true` after calling
+//! [`Guard::try_release`]. It is then the responsibility of the guard, to make sure dynamically
+//! that the memory is no longer aliased. There exist a fallible reclamation method, and a method
+//! for trying to access the memory as well, both of which will succeed if the guard is either nonpresent,
 //! or if [`Guard::try_release`] succeeds. The Drop impl will leak the memory entirely (by not
 //! calling the `Drop` handler of the inner value), if the guard was not able to release the memory
 //! when the buffer goes out of scope. It is thus highly advised to manually keep track of the
 //! buffer, to prevent accidental leakage.
 //!
-//  /*
-//  There are a few corner-cases to these quite strict rules: for example, static references are
-//  guaranteed to never be dropped (at least in Safe Rust), which also includes things like string
-//  literals and other static data. To make APIs more ergonomic, there is also a trait for types
-//  that can trivially be moved out from a guard, because they can never be reclaimed nor written
-//  to (in the case of immutable static references), and are
-//  always valid. For this, there exists a trait [`Unguard`], that is only implemented for static
-//  references pointing to static data. Types that implement [`Unguard`] can always safely be moved
-//  out from [`Guarded`], without needing the guard to agree.
-//  */
+//! There are a few corner-cases to these quite strict rules: while they are required for upholding
+//! the reclamation invariant, the no-access restriction is not necessary for usages that only
+//! _read_ memory. Consider a _write(2)_ system call for instance, which will never write to the
+//! buffer, allowing the memory to be accessed _immutably_ while the guard is active, or mutably
+//! once the guard is released. Because of this, there are marker types [`marker::Shared`] and
+//! [`marker::Exclusive`], as generic parameters to [`Guarded`]. If [`marker::Shared`] is used, the
+//! memory can always be accessed read-only.
 //!
-//! Additionally, there exist some types that handle their guarding mechanism themselves. The
-//! regular [`Guarded`] wrapper assumes that all data comes from the heap, or some other global
-//! location that persists for the duration of the program, but is suboptimal for custom allocators
-//! e.g. in buffer pools. To address this limitation, the [`Guardable`] trait exists to abstracts the role of
-//! what the [`Guarded`] wrapper does, namely being able to insert a guard, protect the memory
-//! until the guard can be released. For flexibilility, __prefer `impl Guardable` rather than
-//! [`Guarded`], if possible__. This trait is implemented by [`Guarded`], and the most notable
-//! example outside of this crate is `BufferSlice` from
+//! Static references are special in the way that they are guaranteed to never be dropped (at least
+//! in Safe Rust), and they obviously include things like string literals and other static data.
+//! However, a guard is still necessary for mutable references, since they could be written to when
+//! they should not, if they were to be moved out from the wrapper.
+//!
+//! Furthermore, there are some types that handle their guarding mechanism themselves, unlike the
+//! [`Guarded`] wrapper. The regular [`Guarded`] wrapper assumes that all data comes from the heap,
+//! or some other global location that persists for the duration of the program, but is suboptimal
+//! for custom allocators e.g. in buffer pools. To address this limitation, the [`Guardable`] trait
+//! exists to abstracts the role of what the [`Guarded`] wrapper does, namely being able to insert
+//! a guard, and then protect the memory until the guard can be released. For flexibilility,
+//! __prefer `impl Guardable` rather than [`Guarded`], if possible__. This trait is implemented by
+//! [`Guarded`], and the most notable example outside of this crate is `BufferSlice` from
 //! [`redox-buffer-pool`](https://gitlab.redox-os.org/redox-os/redox-buffer-pool), that needs to
-//! tell the buffer pool that the pool has guarded memory, to prevent it from deallocating that
-//! memory, that particular slice.
+//! tell the buffer pool (which itself is dynamically allocated) that the pool has guarded memory,
+//! to prevent it from deallocating that that particular slice, or the pool as a whole.
 //!
-//! This interface is roughly analoguous to the `Pin` API offered by `core` and `std`; there is a
-//! wrapper `Guarded` that encapsulates an pointer, and a trait for types that can safely be
-//! released from the guard. However, there are is also a major difference: __`Pin` types do not
-//! prevent memory reallocation _whatsoever_, and the only thing they ensure, is that the inner
-//! type has to have a stable address (i.e. no moving out) before dropping __. Meanwhile, `Guarded`
-//! __will enforce that one can share an address with another process or hardware, that has no
-//! knowledge of when the buffer is getting reclaimed.__
+//! This interface is conceptually roughly analoguous to the [`std::pin::Pin`] API offered by
+//! `core` and `std`; there is a wrapper [`Guarded`] that encapsulates an pointer, and a trait for
+//! types that can safely be released from the guard. However, there are is also a major
+//! difference: __`Pin` types do not prevent memory reclamation on the stack by leaking, nor
+//! mutable aliasing, _whatsoever_, making them unusable for `io_uring`. The only thing they
+//! ensure, is that the inner type has to have a stable address (i.e. no moving out) before
+//! dropping__. Meanwhile, `Guarded` __will enforce that one can share an address with another
+//! process or hardware, that has no knowledge of when the buffer is getting reclaimed.__
 
 #![cfg_attr(not(any(test, feature = "std")), no_std)]
 //#![feature(maybe_uninit_ref)]
@@ -128,26 +131,48 @@ use core::{fmt, mem, ops};
 pub extern crate stable_deref_trait;
 pub use stable_deref_trait::StableDeref;
 
+pub mod marker {
+    /// A marker for memory regions that cannot be mutated, and thus lift the memory accessibility
+    /// restriction, and only require safe memory reclamation.
+    pub struct Shared {
+        _not_creatable: (),
+    }
+    /// A marker for memory regions that _may_ be mutated, and hence require exclusive access.
+    /// Using this marker, the [`Guarded`] wrapper will forbid simply accessing the memory, until
+    /// the guard is released.
+    pub struct Exclusive {
+        _not_creatable: (),
+    }
+
+    mod private {
+        pub trait Aliasable {}
+    }
+    impl private::Aliasable for Shared {}
+}
+
 /// A trait for guards, that decide whether memory can be deallocated, or whether it may be shared
 /// with an actor outside of control from this process at all.
 ///
-/// An example of such a guard type, is `CommandFutureGuard` from
-/// [`redox-iou`](https://gitlab.redox-os.org/redox-os/redox-iou), that associates a guarded piece
-/// of memory, with a future representing a pending submission and completion from a Redox
-/// `io_uring`. As the `io_uring` interface is zero-copy and allows the kernel (or another process,
-/// for Redox) to use the memory that was part of the system call, until the completion
-// TODO: Investigate whether this is of use when it comes to concurrent memory reclamation, using
-// epochs (`crossbeam-epoch`) or hazard pointers (`conc`), and whether there can be integration
-// between those and this trait.
+/// In an `io_uring` context, these will typically associate one (for exclusive or shared memory)
+/// or more futures (for shared memory) with a memory region. In such a case, the guard will
+/// succeed with the [`try_release`] operation, once it can prove that no pending operation is
+/// accessing that memory.
+///
+/// # Safety
+///
+/// Safe code must obviously be able to use the guarding API soundly, and for memory to actually be
+/// shared, the guard must ensure that the aliasing and reclamation invariants are upheld. However,
+/// since the guard type is strictly dependent on the context where the guards are actually used,
+/// this trait itself is not unsafe to implement, as it does not introduce any unsafe contract that
+/// unsafe code can rely on. The code that shares the memory with the kernel will already require
+/// unsafe code in order to be able to break any invariants regarding aliasing and data races in
+/// the first place.
+// TODO: Investigate whether this could be of use when it comes to concurrent memory reclamation,
+// using epoch counts (`crossbeam-epoch`) or hazard pointers (`conc`), and whether there can be
+// integration between those systems and this trait.
 pub trait Guard {
-    /// Try to release the guard, returning either true for success or false for failure.
+    /// Try to release the guard, returning either `true` if the memory could be reclaimed, or `false` for failure.
     fn try_release(&self) -> bool;
-
-    /// A function that allows the guard to tell the wrapper whether the guarded memory could be
-    /// written to for the lifetime of the guard. If this is false, which is possible in some
-    /// scenarios (e.g. for a future that gives a read-only buffer to the kernel as part of a
-    /// syscall), read-only access to the guarded may be granted.
-    fn external_may_write(&self) -> bool { true }
 }
 
 /// A no-op guard, that cannot be initialized but still useful in type contexts. This the
@@ -174,34 +199,40 @@ impl fmt::Display for TryUnguardError {
 #[cfg(feature = "std")]
 impl std::error::Error for TryUnguardError {}
 
-/// A wrapper for types that can be "guarded", meaning that the memory their reference cannot be
-/// safely reclaimed or even moved out, until the guard frees it.
+/// A wrapper for types that can be "guarded", meaning that the memory they point to cannot be
+/// safely reclaimed or even moved out, until the guard frees it. For exclusive-access buffers
+/// (which are written to, in other words), the data is also completely unaccessible until the
+/// guard is released.
 ///
 /// This wrapper is in a way similar to [`std::pin::Pin`], in the sense that the inner value cannot
 /// be moved out. The difference with this wrapper type, is that unlike Pin, which guarantees that
 /// the address be stable until Drop, this type guarantees that the address be stable until the
-/// guard can be released, and that Drop leaks without the approval of the guard.
+/// guard can be released, that Drop leaks without the approval of the guard, and that the memory
+/// cannot be aliased mutably with the kernel.
 ///
-/// Thus, rather than allowing arbitrary type to be guarded as with `Pin` (even though anyone can
+/// Rather than allowing arbitrary type to be guarded as with `Pin` (even though anyone can
 /// trivially implement [`std::ops::Deref`] for a type that doesn't have a fixed location, like
-/// simply taking the address of self), Guarded will also add additional restrictions:
+/// simply taking the address of self), [`Guarded`] will also add additional restrictions that are
+/// needed to initialize the wrapper _in safe code_:
 ///
-/// * First, the data must be static, because the data must not be removed even if the guard is
-/// leaked. A leaked borrow is the same as a dropped borrow, but without the destructor run, and
-/// even if the destructor were run, the data couldn't be leaked since it was borrowed from
-/// somewhere else. Note that static references are allowed here though, since they are never ever
-/// dropped.
-/// * Secondly, the data must implement [`std::ops::Deref`], since it doesn't make sense for
-/// non-pointers to be guarded. Sure, I could Pin a `[u8; 1024]` wrapper that simply `Deref`ed by
-/// borrowing the on-stack data. Deref only allows the type to act as smart pointer, and to work
-/// around the aforementioned limitation of Deref, [`StableDeref`] is also required.
+/// * First, the data must be static (as in `T: 'static`), because a borrow with a shorter lifetime
+/// `'a`, can be cancelled without ever calling the destructor, allowing the kernel process that
+/// shares the memory, to overwrite memory locations that could then be used for regular variables,
+/// or it could read undefined or secret data.
+/// * Secondly, the data must implement [`std::ops::Deref`], since it does not make sense for
+/// non-pointers to be guarded, as they obviously do not represent buffers in that case. Although
+/// it is possible to Pin a `[u8; 1024]`-wrapper that simply `Deref`s by borrowing the on-stack
+/// data, because Deref allows the type to dereference into a borrowed field of a struct that can
+/// freely move on the stack, [`StableDeref`] is also required.
 ///
-/// Just like with `Pin`, `Guarded` will not allow mutable access to the pointer, but only to the
-/// pointee. This is to prevent collections like `Vec` from reallocating (which is really easy if
-/// one retrieves a mutable reference to a Vec), where the address can freely change. However,
-/// unlike Pin that only allows the address to change after the destructor is run, this wrapper
-/// will allow the pointer to be moved out dynamically, provided that the guard can ensure the data
-/// is no longer shared.
+/// Note that while these traits must be implemented on the wrapped type to create a [`Guarded`] in
+/// safe code, the wrapper can still be created using [`Guarded::new_unchecked`], where the caller
+/// must ensure that the guarded type is only used in a context where no futures using
+/// stack-borrowed memory are leaked, and that the `Deref` implementation is correct.
+///
+/// When the wrapper is guarded, the inner pointer can neither be accessed mutably, immutably for
+/// exclusive memory regions, nor be moved out. There are however unsafe functions to bypass these
+/// restrictions.
 pub struct Guarded<G, T, M>
 where
     G: Guard,
@@ -223,9 +254,11 @@ where
     /// # Safety
     ///
     /// Since both safe and unsafe code can assume that the pointee will never change its address,
-    /// never be dropped without the guard allowing that, and never be reclaimable when leaked.
-    /// Hence, it is allowed to pass a reference here, so long as one can ensure those invariants
-    /// are upheld.
+    /// never be dropped without the guard allowing that, and never be reusable when leaked, those
+    /// invariants must be upheld by the caller when calling this. __If the data is non-static and
+    /// thus borrowed, great care must be taken to make sure that the entire program, and all
+    /// possible executors with futures where this data may be borrowed from, always uphold the
+    /// aliasing and relamation invariants.__
     pub unsafe fn new_unchecked(inner: T) -> Self {
         Self {
             inner: MaybeUninit::new(inner),
@@ -238,12 +271,13 @@ where
     ///
     /// This associated function requires that `T` be both `'static` and [`StableDeref`]. The
     /// reason for this, is that `'static` ensures that the type does not contain any references,
-    /// directly or indirectly, which when dropped again allow the references to be reused, which
-    /// would violate guarding invariant.
+    /// directly or indirectly, which when dropped allow the references to be reused again,
+    /// potentially violating both the aliasing and reclamation invariants.
     ///
     /// Additionally, it must also implement [`StableDeref`], to make sure that the pointer also
     /// maintains an address that will never change. This requirement is as crucial as the guards
-    /// and the dropping themselves.
+    /// and the dropping themselves. If a pointer is given to an external process or the kernel,
+    /// that address must always be part of this memory region.
     pub fn new(inner: T) -> Self
     where
         T: 'static + StableDeref,
@@ -252,8 +286,8 @@ where
     }
     /// Apply a guard to the wrapper, which will make it impossible for the inner value to be moved
     /// out (unless using unsafe of course). Additionally, __the buffer will become temporarily
-    /// unusable, since the memory may be written to__. The memory will be leaked completely if the
-    /// destructor is called when the guard cannot release the pointer.
+    /// unusable, since the memory may be written to if it is exclusive__. The memory will be
+    /// leaked completely if the destructor is called when the guard cannot release the pointer.
     pub fn guard(&mut self, guard: G) {
         assert!(self.guard.is_none());
         self.guard = Some(guard);
@@ -270,7 +304,7 @@ where
     /// reclaimed when some other entity could be using it simultaneously. For this not to lead to
     /// UB, the caller must not reclaim the memory owned here unless it can absolutely be sure that
     /// the guard is no longer needed.
-    pub unsafe fn force_unguard(&mut self) -> Option<G> {
+    pub unsafe fn unguard_unchecked(&mut self) -> Option<G> {
         self.guard.take()
     }
 
@@ -287,15 +321,16 @@ where
         }
     }
     /// Move out the inner value of this wrapper, together with the guard if there was one. The
-    /// guard will not be released, and is instead up to the caller.
+    /// guard will not be released, and it is instead up to the caller to make sure that the rules
+    /// of the specific guard type are followed.
     ///
     /// # Safety
     ///
-    /// This is unsafe for the same reasons as with [`force_unguard`]; as the guard is left
+    /// This is unsafe for the same reasons as with [`unguard_unchecked`]; as the guard is left
     /// untouched, it's completely up to the caller to ensure that the invariants required by the
     /// guard be upheld.
     ///
-    /// [`force_unguard`]: #method.force_unguard
+    /// [`unguard_unchecked`]: #method.unguard_unchecked
     pub unsafe fn into_inner_unchecked(mut self) -> (T, Option<G>) {
         let guard = self.guard.take();
         let inner = self.uninitialize_inner();
@@ -312,7 +347,7 @@ where
         };
 
         if guard.try_release() {
-            Ok(unsafe { self.force_unguard() })
+            Ok(unsafe { self.unguard_unchecked() })
         } else {
             Err(TryUnguardError)
         }
@@ -419,14 +454,14 @@ where
         Some(unsafe { self.get_pointer_unchecked_mut() })
     }
 }
-impl<G, T> Guarded<G, T, ReadOnly>
+impl<G, T> Guarded<G, T, marker::Shared>
 where
     G: Guard,
     T: ops::Deref,
 {
     /// Obtain a reference to the pointer.
     pub fn get_pointer_ref(&self) -> &T {
-        // SAFETY: This is safe since the ReadOnly mode implies that the memory protected by this
+        // SAFETY: This is safe since the Shared mode implies that the memory protected by this
         // guard cannot be written to by the external actor. Since the constructor for this type
         // requires the address to be stable, and not modified unless via a "&mut" method,
         // retrieving the pointer in this case is harmless.
@@ -435,7 +470,7 @@ where
 
     /// Obtain a reference to the pointee.
     pub fn get_ref(&self) -> &<T as ops::Deref>::Target {
-        // SAFETY: As with get_pointer_ref, this is safe since the wrapper is marked ReadOnly, and
+        // SAFETY: As with get_pointer_ref, this is safe since the wrapper is marked Shared, and
         // the address is already assumed to be stable.
         unsafe { self.get_unchecked_ref() }
     }
@@ -477,10 +512,6 @@ where
     }
 }
 
-pub enum WriteOnly {}
-pub enum ReadOnly {}
-pub enum ReadWrite {}
-
 impl<G, T, M> Drop for Guarded<G, T, M>
 where
     G: Guard,
@@ -495,7 +526,7 @@ where
         }
     }
 }
-impl<G, T> ops::Deref for Guarded<G, T, ReadOnly>
+impl<G, T> ops::Deref for Guarded<G, T, marker::Shared>
 where
     G: Guard,
     T: ops::Deref,
@@ -506,7 +537,7 @@ where
         self.get_ref()
     }
 }
-impl<G, T, U> AsRef<U> for Guarded<G, T, ReadOnly>
+impl<G, T, U> AsRef<U> for Guarded<G, T, marker::Shared>
 where
     G: Guard,
     T: ops::Deref<Target = U>,
@@ -525,27 +556,28 @@ where
         Self::new(inner)
     }
 }
-unsafe impl<G, T> StableDeref for Guarded<G, T, ReadOnly>
+unsafe impl<G, T> StableDeref for Guarded<G, T, marker::Shared>
 where
     G: Guard,
     T: ops::Deref,
 {}
 
-/// A trait for types that can be "guardable", meaning that they won't do anything on Drop unless
-/// they can remove their guard.
+/// A trait for types that can be "guardable", meaning that they only leak on Drop unless they can
+/// remove their guard, that their memory cannot be read from if the kernel may mutate it, and that
+/// the memory cannot be written to when the kernel may read it.
 ///
 /// # Safety
 ///
 /// This trait is unsafe to implement, due to the following invariants that must be upheld:
 ///
-/// * When invoking [`try_guard`], any pointers to self must not be invalidated, which wouldn't be the
-///   case for e.g. a Vec that inserted a new item when guarding. Additionally, the function must not
-///   in any way access the inner data that is being guarded, since the futures will have references
-///   before even sending the guard, to that data.
+/// * When invoking [`try_guard`], which takes a mutable reference, any pointers to self must not
+/// be invalidated, which wouldn't be the case for e.g. a Vec that inserted a new item when
+/// guarding. Additionally, the function must not in any way access the inner data that is being
+/// guarded, since the futures will have references before even sending the guard, to that data.
 /// * When dropping, the data _must not_ be reclaimed, until the guard that this type has received,
-///   is successfully released.
-/// * The inner data must implement [`std::pin::Unpin`] or follow equivalent rules; if this
-///   guardable is leaked, the data must no longer be accessible (this rules out data on the stack).
+/// is successfully released.
+/// * Once the guard is present, it must be impossible for either the kernel or this process to
+/// mutably access the data, while it is being accessed simultaneously.
 ///
 /// [`try_guard`]: #method.try_guard
 pub unsafe trait Guardable<G> {
@@ -560,7 +592,7 @@ pub unsafe trait Guardable<G> {
 unsafe impl<G, T, M> Guardable<G> for Guarded<G, T, M>
 where
     G: Guard,
-    T: StableDeref + 'static + ops::Deref,
+    T: ops::Deref,
 {
     fn try_guard(&mut self, guard: G) -> Result<(), G> {
         if self.has_guard() {
@@ -580,6 +612,6 @@ mod tests {
     #[test]
     fn safely_create_guarded_to_static_ref() {
         let static_ref: &'static [u8] = &STATIC_DATA;
-        let _ = Guarded::<NoGuard, _, ReadOnly>::new(static_ref);
+        let _ = Guarded::<NoGuard, _, marker::Shared>::new(static_ref);
     }
 }
