@@ -3,8 +3,13 @@ name = "guard-trait"
 version = "0.1.0"
 authors = ["4lDO2 <4lDO2@protonmail.com>"]
 edition = "2018"
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+description = "Contains wrappers that allow memory to be protected using a guard, used mostly for safe io_uring memory abstractions."
+documentation = "https://docs.rs/guard-trait"
+readme = "README.md"
+repository = "https://github.com/4lDO2/guard-trait-rs"
+license = "MIT"
+keywords = ["memory-management", "io_uring"]
+categories = ["memory-management", "no-std"]
 
 [features]
 default = ["std"]
