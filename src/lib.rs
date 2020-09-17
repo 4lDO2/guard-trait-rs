@@ -68,7 +68,7 @@
 //! challenges.
 //!
 //! # Interface
-//! 
+//!
 //! The main type that this crate provides, is the [`Guarded`] struct. [`Guarded`] is a wrapper
 //! that encapsulates any stable pointer (which in safe code, can only be done for types that
 //! implement [`StableDeref`]). The reason for [`StableDeref`] is because the memory must point to
@@ -125,8 +125,8 @@
 #![cfg_attr(not(any(test, feature = "std")), no_std)]
 #![cfg_attr(feature = "nightly", feature(maybe_uninit_ref, maybe_uninit_extra))]
 
-use core::mem::MaybeUninit;
 use core::marker::PhantomData;
+use core::mem::MaybeUninit;
 use core::{fmt, mem, ops};
 
 pub extern crate stable_deref_trait;
@@ -139,9 +139,11 @@ pub mod marker {
     /// A marker for memory regions that _may_ be mutated, and hence require exclusive access.
     /// Using this marker, the [`Guarded`] wrapper will forbid simply accessing the memory, until
     /// the guard is released.
+    ///
+    /// [`Guarded`]: ../struct.Guarded.html
     pub enum Exclusive {}
 
-    /// The "borrow mode" that the kernel will use when using the memory region. This can only be 
+    /// The "borrow mode" that the kernel will use when using the memory region. This can only be
     pub trait Mode: private::Sealed {
         const IS_ALIASABLE: bool;
     }
@@ -176,6 +178,8 @@ pub mod marker {
 /// unsafe code can rely on. The code that shares the memory with the kernel will already require
 /// unsafe code in order to be able to break any invariants regarding aliasing and data races in
 /// the first place.
+///
+/// [`try_release`]: #tymethod.try_release
 // TODO: Investigate whether this could be of use when it comes to concurrent memory reclamation,
 // using epoch counts (`crossbeam-epoch`) or hazard pointers (`conc`), and whether there can be
 // integration between those systems and this trait.
@@ -397,6 +401,8 @@ where
     /// NOTE: If the generic parameter `M` is [`marker::Shared`], then this will never fail, since
     /// the kernel is not allowed to write to the memory simultaneously. If it can be guaranteed at
     /// the type level that this is the case, it is preferable to use [`get_ref`] in lieu.
+    ///
+    /// [`get_ref`]: #method.get_ref
     pub fn try_get_ref(&self) -> Option<&<T as ops::Deref>::Target> {
         if !M::IS_ALIASABLE && self.has_guard() {
             return None;
@@ -409,6 +415,8 @@ where
     /// # Safety
     ///
     /// See [`get_ref`] for a more detailed explanation of the required invariants for this method.
+    ///
+    /// [`get_ref`]: #method.get_ref
     pub unsafe fn get_unchecked_mut(&mut self) -> &mut <T as ops::Deref>::Target
     where
         T: ops::DerefMut,
@@ -421,6 +429,8 @@ where
     ///
     /// Unlike [`try_get_ref`], there is never a case when shared memory can be accessed mutably,
     /// and thus this will only succeed if there is no guard present.
+    ///
+    /// [`try_get_ref`]: #method.try_get_ref
     pub fn try_get_mut(&mut self) -> Option<&mut <T as ops::Deref>::Target>
     where
         T: ops::DerefMut,
@@ -464,6 +474,8 @@ where
     /// This cannot violate any invariant required by [`StableDeref`], since it requires that the
     /// pointer must not be changeable the address via a method that takes a shared reference (i.e.
     /// not `&mut`).
+    ///
+    /// [`get_pointer_ref`]: #method.get_pointer_ref
     pub unsafe fn get_pointer_unchecked_ref(&self) -> &T {
         // TODO: use this by default once #![feature(maybe_uninit_ref)] is stabilized.
         #[cfg(feature = "nightly")]
@@ -479,6 +491,8 @@ where
     /// guard.
     ///
     /// Prefer [`get_pointer_ref`] if it is known that `M` is [`marker::Shared`].
+    ///
+    /// [`get_pointer_ref`]: #method.get_pointer_ref
     pub fn try_get_pointer_ref(&self) -> Option<&T> {
         if !M::IS_ALIASABLE && self.has_guard() {
             return None;
@@ -629,7 +643,8 @@ unsafe impl<G, T> StableDeref for Guarded<G, T, marker::Shared>
 where
     G: Guard,
     T: ops::Deref,
-{}
+{
+}
 
 /// A trait for types that can be "guardable", meaning that they only leak on Drop unless they can
 /// remove their guard, that their memory cannot be read from if the kernel may mutate it, and that
@@ -652,9 +667,6 @@ where
 pub unsafe trait Guardable<G> {
     /// Attempt to insert a guard into the guardable, if there wasn't already a guard inserted. If
     /// that were the case, error with the guard that wasn't able to be inserted.
-    ///
-    /// If the pointee of self (i.e. `<Self as ops::Deref>::Target`) implements [`Unguard`], then
-    /// this method needs not be called.
     fn try_guard(&mut self, guard: G) -> Result<(), G>;
 }
 
@@ -680,8 +692,13 @@ mod tests {
     const STATIC_DATA: [u8; 13] = *b"Hello, world!";
 
     #[test]
-    fn safely_create_guarded_to_static_ref() {
+    fn immutable_static_ref() {
         let static_ref: &'static [u8] = &STATIC_DATA;
         let _ = Guarded::<NoGuard, _, marker::Shared>::new(static_ref);
+    }
+
+    #[test]
+    fn mutable_static_ref() {
+        let static_ref_mut: &'static mut [u8] = Box::leak(STATIC_DATA.to_vec().into_boxed_slice());
     }
 }
