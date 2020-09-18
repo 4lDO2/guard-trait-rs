@@ -795,4 +795,10 @@ mod tests {
         assert_eq!(guarded.try_unguard(), Ok(Some(MyGuard(true))));
         assert_eq!(guarded.try_unguard(), Ok(None));
     }
+
+    #[test]
+    fn wrapping_string_literals() {
+        // NOTE: We do not test the actual functionality, but the very ability not omit the types.
+        let _: Guarded<NoGuard, _, _> = Guarded::wrap_static_slice(b"Hello there.");
+    }
 }
