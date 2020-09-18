@@ -122,6 +122,7 @@
 //! dropping__. Meanwhile, `Guarded` __will enforce that one can share an address with another
 //! process or hardware, that has no knowledge of when the buffer is getting reclaimed.__
 
+#![deny(broken_intra_doc_links, missing_docs)]
 #![cfg_attr(not(any(test, feature = "std")), no_std)]
 #![cfg_attr(feature = "nightly", feature(maybe_uninit_ref, maybe_uninit_extra))]
 
@@ -132,6 +133,8 @@ use core::{fmt, mem, ops};
 pub extern crate stable_deref_trait;
 pub use stable_deref_trait::StableDeref;
 
+/// A module for markers, mainly intended to distinguish between shared (read-only) and exclusive
+/// (write capable) memory.
 pub mod marker {
     /// A marker for memory regions that cannot be mutated, and thus lift the memory accessibility
     /// restriction, and only require safe memory reclamation.
@@ -145,6 +148,8 @@ pub mod marker {
 
     /// The "borrow mode" that the kernel will use when using the memory region. This can only be
     pub trait Mode: private::Sealed {
+        /// A constant that is set true if the marker type allows the guard to only provide
+        /// _aliasable_ memory, akin to Rust's `&` references (unlike `&mut`).
         const IS_ALIASABLE: bool;
     }
 
@@ -564,6 +569,32 @@ where
         // SAFETY: As with get_pointer_ref, this is safe since the wrapper is marked Shared, and
         // the address is already assumed to be stable.
         unsafe { self.get_unchecked_ref() }
+    }
+}
+impl<G> Guarded<G, &'static [u8], marker::Shared>
+where
+    G: Guard,
+{
+    /// Wrap an immutable static byte slice. This is a convenience function over [`new`], with the
+    /// marker type already set to [`marker::Shared`], as well as being able to coerce literals
+    /// (which are arrays) into slices.
+    ///
+    /// [`new`]: #method.new
+    pub fn wrap_static_slice(slice: &'static [u8]) -> Self {
+        Self::new(slice)
+    }
+}
+impl<G> Guarded<G, &'static mut [u8], marker::Exclusive>
+where
+    G: Guard,
+{
+    /// Wrap a mutable static byte slice. Like with [`wrap_static_slice`], this is solely a
+    /// convenience function over [`new`], but with the marker type set to [`marker::Exclusive`].
+    ///
+    /// [`wrap_static_slice`]: #method.wrap_static_slice
+    /// [`new`]: #method.new
+    pub fn wrap_static_slice_mut(slice: &'static mut [u8]) -> Self {
+        Self::new(slice)
     }
 }
 impl<G, T, M> fmt::Debug for Guarded<G, T, M>
