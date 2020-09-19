@@ -190,7 +190,7 @@ pub mod marker {
 // integration between those systems and this trait.
 pub trait Guard {
     /// Try to release the guard, returning either `true` if the memory could be reclaimed, or `false` for failure.
-    fn try_release(&self) -> bool;
+    fn try_release(&mut self) -> bool;
 }
 
 /// A no-op guard, that cannot be initialized but still useful in type contexts. This the
@@ -201,7 +201,7 @@ pub trait Guard {
 pub enum NoGuard {}
 
 impl Guard for NoGuard {
-    fn try_release(&self) -> bool {
+    fn try_release(&mut self) -> bool {
         unreachable!("NoGuard cannot be initialized")
     }
 }
@@ -363,7 +363,7 @@ where
     /// Try removing the guard in-place, failing if the guard returned false when invoking
     /// [`Guard::try_release`].
     pub fn try_unguard(&mut self) -> Result<Option<G>, TryUnguardError> {
-        let guard = match self.guard.as_ref() {
+        let guard = match self.guard.as_mut() {
             Some(g) => g,
             None => return Ok(None),
         };
@@ -749,7 +749,7 @@ mod tests {
         struct MyGuard(bool);
 
         impl Guard for MyGuard {
-            fn try_release(&self) -> bool {
+            fn try_release(&mut self) -> bool {
                 self.0
             }
         }
