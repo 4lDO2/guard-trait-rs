@@ -124,10 +124,9 @@
 
 #![deny(broken_intra_doc_links, missing_docs)]
 #![cfg_attr(not(any(test, feature = "std")), no_std)]
-#![cfg_attr(feature = "nightly", feature(maybe_uninit_ref, maybe_uninit_extra))]
 
 use core::marker::PhantomData;
-use core::mem::MaybeUninit;
+use core::mem::ManuallyDrop;
 use core::{fmt, mem, ops};
 
 pub extern crate stable_deref_trait;
@@ -259,8 +258,7 @@ where
     T: ops::Deref,
     M: marker::Mode,
 {
-    // TODO: Allow layout optimization by not using MaybeUninit.
-    inner: MaybeUninit<T>,
+    inner: ManuallyDrop<T>,
     guard: Option<G>,
     _marker: PhantomData<M>,
 }
@@ -284,7 +282,7 @@ where
     #[inline]
     pub unsafe fn new_unchecked(inner: T) -> Self {
         Self {
-            inner: MaybeUninit::new(inner),
+            inner: ManuallyDrop::new(inner),
             guard: None,
             _marker: PhantomData,
         }
@@ -383,15 +381,7 @@ where
     }
     #[inline]
     unsafe fn uninitialize_inner(&mut self) -> T {
-        // TODO: always use this when #![feature(maybe_uninit_extra)] is stabilized.
-        #[cfg(feature = "nightly")]
-        {
-            self.inner.assume_init_read()
-        }
-        #[cfg(not(feature = "nightly"))]
-        {
-            mem::replace(&mut self.inner, MaybeUninit::uninit()).assume_init()
-        }
+        ManuallyDrop::take(&mut self.inner)
     }
     /// Obtain a reference to the pointee of the value protected by this guard.
     ///
@@ -503,15 +493,7 @@ where
     /// [`get_pointer_ref`]: #method.get_pointer_ref
     #[inline]
     pub unsafe fn get_pointer_unchecked_ref(&self) -> &T {
-        // TODO: use this by default once #![feature(maybe_uninit_ref)] is stabilized.
-        #[cfg(feature = "nightly")]
-        {
-            self.inner.assume_init_ref()
-        }
-        #[cfg(not(feature = "nightly"))]
-        {
-            &*(&self.inner as *const MaybeUninit<T> as *const T)
-        }
+        &self.inner
     }
     /// Try to get a reference to the pointer encapsulated by this wrapper, unless there is a
     /// guard.
@@ -541,17 +523,7 @@ where
     /// collection.
     #[inline]
     pub unsafe fn get_pointer_unchecked_mut(&mut self) -> &mut T {
-        // TODO: move this from the nightly feature flag to the default once
-        // #![feature(maybe_uninit_ref)] is stabilized.
-
-        #[cfg(feature = "nightly")]
-        {
-            self.inner.assume_init_mut()
-        }
-        #[cfg(not(feature = "nightly"))]
-        {
-            &mut *(&mut self.inner as *mut MaybeUninit<T> as *mut T)
-        }
+        &mut self.inner
     }
     /// Try to attain a mutable reference to the inner data, failing if there is a guard allowing
     /// the data to be accessed by the kernel.
