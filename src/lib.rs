@@ -43,8 +43,8 @@
 //! using the memory again in any reasonable way, if the future were to be `Drop`ped, without
 //! blocking indefinitely. What is even worse, is that futures can be leaked at any time, and
 //! arrays allocated on the stack can also be dropped, when the memory is still in use by the
-//! kernel, as a buffer to write data from e.g. a socket. If a (mutable) buffer of a stack is then
-//! used for regular variables... arbitrary program corruption!
+//! kernel, as a buffer to write data from e.g. a socket. If a (mutable) buffer on the stack is
+//! then reused later for regular variables... arbitrary program corruption!
 //!
 //! What we need in order to solve these two complications, is some way to be able to mark a memory
 //! region as both "borrowed by the kernel" (mutably or immutably), and "undroppable". Since the
@@ -696,23 +696,30 @@ where
 ///
 /// This trait is unsafe to implement, due to the following invariants that must be upheld:
 ///
-/// * When invoking [`try_guard`], which takes a mutable reference, any pointers to self must not
-/// be invalidated, which wouldn't be the case for e.g. a Vec that inserted a new item when
-/// guarding. Additionally, the function must not in any way access the inner data that is being
-/// guarded, since the futures will have references before even sending the guard, to that data.
-/// * When dropping, the data _must not_ be reclaimed, until the guard that this type has received,
+/// * when invoking [`try_guard`], any pointers to the inner must not be invalidated, which is
+/// something that the plain [`StableDeref`] does not protect against when taking a mutable
+/// reference. This could be the case for e.g. a Vec that inserted a new item when guarding;
+/// * if the generic type parameter `M` is [`marker::Shared`], then the method must not access the
+/// inner memory mutably, which would violate the aliasing invariant.
+/// * if `M` is [`marker::Exclusive`], then the previous restriction is stronger: the method must
+/// not in any way access the inner data that is being guarded, mutably or immutably, since the
+/// futures may have references to the inner memory, even before there is a guard protecting that
+/// data;
+/// * when dropping, the data _must not_ be reclaimed, until the guard that this type has received,
 /// is successfully released.
-/// * Once the guard is present, it must be impossible for either the kernel or this process to
-/// mutably access the data, while it is being accessed simultaneously.
 ///
 /// [`try_guard`]: #method.try_guard
-pub unsafe trait Guardable<G> {
-    /// Attempt to insert a guard into the guardable, if there wasn't already a guard inserted. If
-    /// that were the case, error with the guard that wasn't able to be inserted.
+pub unsafe trait Guardable<G, M>
+where
+    G: Guard,
+    M: marker::Mode,
+{
+    /// Attempt to insert a guard into the guardable, if there was not already a guard inserted. If
+    /// that were the case, error with the guard that was not able to be inserted.
     fn try_guard(&mut self, guard: G) -> Result<(), G>;
 }
 
-unsafe impl<G, T, M> Guardable<G> for Guarded<G, T, M>
+unsafe impl<G, T, M> Guardable<G, M> for Guarded<G, T, M>
 where
     G: Guard,
     T: ops::Deref,
