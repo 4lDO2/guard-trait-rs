@@ -744,6 +744,8 @@ where
     /// Shared (and therefore aliasable and immutable) guardables can access the data, but only
     /// immutable, no matter whether a guard is protecting it or not, since immutable memory is
     /// allowed to have multiple references to it.
+    ///
+    /// [`try_get_data_mut`]: ./trait.GuardableExclusive.html#tymethod.try_get_data_mut
     fn try_get_data(&self) -> Option<&T>;
 }
 
@@ -780,8 +782,14 @@ pub unsafe trait GuardableExclusive<G, T>: Guardable<G, T>
 where
     G: Guard,
     T: ?Sized,
-    // TODO: Support reference-like wrappers by using GATs.
 {
+    // TODO: Support reference-like wrappers by using GATs. The current model of these guardable
+    // traits, where the inner memory is borrowed directly, works perfectly for nearly all
+    // applications, which involve passing user pointers to the kernel. However, for
+    // userspace-to-userspace `io_uring`s that Redox has, buffers are allowed not not be
+    // represented as regular addresses, but rather the offsets within a buffer pool. This is
+    // somewhat hard to abstract over, thus forcing an implementation of this trait to uphold
+    // additional guarantees.
     /// Attempt to retrieve the inner mutable data, so long as there is not a guard.
     fn try_get_data_mut(&mut self) -> Option<&mut T>;
 }
