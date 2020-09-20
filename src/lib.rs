@@ -780,6 +780,7 @@ pub unsafe trait GuardableExclusive<G, T>: Guardable<G, T>
 where
     G: Guard,
     T: ?Sized,
+    // TODO: Support reference-like wrappers by using GATs.
 {
     /// Attempt to retrieve the inner mutable data, so long as there is not a guard.
     fn try_get_data_mut(&mut self) -> Option<&mut T>;
