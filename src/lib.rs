@@ -545,6 +545,25 @@ where
     pub fn guard_mut(&mut self) -> Option<&mut G> {
         self.guard.as_mut()
     }
+
+    /// Map the inner value pointed to by the guard, to a reference that is allowed to borrow data
+    /// from the guarded.
+    pub fn try_map<F, E, U>(self, i: F) -> Result<MappedGuarded<G, T, M, U>, TryMapError<E>>
+    where
+        F: for<'this> FnOnce(&'this T::Target) -> Result<&'this U, E>,
+        U: ?Sized,
+    {
+        if let Some(inner_data_ref) = self.try_get_ref() {
+            let mapped: *mut U =
+                i(inner_data_ref).map_err(TryMapError::ClosureFailure)? as *const U as *mut U;
+            Ok(MappedGuarded {
+                inner: self,
+                mapped,
+            })
+        } else {
+            Err(TryMapError::ConflictingGuard)
+        }
+    }
 }
 impl<G, T> Guarded<G, T, marker::Shared>
 where
@@ -567,6 +586,32 @@ where
         // SAFETY: As with get_pointer_ref, this is safe since the wrapper is marked Shared, and
         // the address is already assumed to be stable.
         unsafe { self.get_unchecked_ref() }
+    }
+}
+impl<G, T> Guarded<G, T, marker::Exclusive>
+where
+    G: Guard,
+    T: ops::Deref + ops::DerefMut,
+{
+    /// Map the inner value pointed to by the guard, to a reference that is allowed to borrow data
+    /// from the guarded.
+    pub fn try_map_mut<F, E, U>(
+        mut self,
+        i: F,
+    ) -> Result<MappedGuarded<G, T, marker::Exclusive, U>, TryMapError<E>>
+    where
+        F: for<'this> FnOnce(&'this mut T::Target) -> Result<&'this mut U, E>,
+        U: ?Sized,
+    {
+        if let Some(inner_data_ref) = self.try_get_mut() {
+            let mapped: *mut U = i(inner_data_ref).map_err(TryMapError::ClosureFailure)?;
+            Ok(MappedGuarded {
+                inner: self,
+                mapped,
+            })
+        } else {
+            Err(TryMapError::ConflictingGuard)
+        }
     }
 }
 impl<G> Guarded<G, &'static [u8], marker::Shared>
@@ -837,6 +882,108 @@ where
     }
 }
 
+/// A mapped guard, which has had a one-closure applied to it. This is similar to how crates like
+/// `owning_ref` work.
+pub struct MappedGuarded<G, T, M, U>
+where
+    G: Guard,
+    T: ops::Deref,
+    M: marker::Mode,
+    U: ?Sized,
+{
+    inner: Guarded<G, T, M>,
+    mapped: *mut U,
+}
+
+impl<G, T, M, U> MappedGuarded<G, T, M, U>
+where
+    G: Guard,
+    T: ops::Deref,
+    M: marker::Mode,
+    U: ?Sized,
+{
+    /// Convert the mapped guard into the unmapped, cancelling the temporary borrow.
+    pub fn into_unmapped(self) -> Guarded<G, T, M> {
+        self.inner
+    }
+}
+
+unsafe impl<G, T, M, U> Guardable<G, U> for MappedGuarded<G, T, M, U>
+where
+    G: Guard,
+    T: ops::Deref,
+    M: marker::Mode,
+    U: ?Sized,
+{
+    #[inline]
+    fn try_guard(&mut self, guard: G) -> Result<(), G> {
+        self.inner.try_guard(guard)
+    }
+    #[inline]
+    fn try_get_data(&self) -> Option<&U> {
+        if !M::IS_ALIASABLE && self.inner.has_guard() {
+            None
+        } else {
+            Some(unsafe { &*self.mapped })
+        }
+    }
+}
+unsafe impl<G, T, U> GuardableShared<G, U> for MappedGuarded<G, T, marker::Shared, U>
+where
+    G: Guard,
+    T: ops::Deref,
+    U: ?Sized,
+{
+    #[inline]
+    fn data_shared(&self) -> &U {
+        unsafe { &*self.mapped }
+    }
+}
+unsafe impl<G, T, U> GuardableExclusive<G, U> for MappedGuarded<G, T, marker::Exclusive, U>
+where
+    G: Guard,
+    T: ops::Deref + ops::DerefMut,
+    U: ?Sized,
+{
+    #[inline]
+    fn try_get_data_mut(&mut self) -> Option<&mut U> {
+        if self.inner.has_guard() {
+            None
+        } else {
+            Some(unsafe { &mut *self.mapped })
+        }
+    }
+}
+
+// TODO: add Guarded::map_shared() for marker::Shared, which never fails with ConflictingGuard.
+
+/// The possible errors caused by [`Guarded::try_map`] and [`Guarded::try_map_mut`].
+#[derive(Debug)]
+pub enum TryMapError<E> {
+    /// The closure returned an error.
+    ClosureFailure(E),
+
+    /// There was already a guard present, making the data inaccessible.
+    ConflictingGuard,
+}
+
+impl<E> fmt::Display for TryMapError<E>
+where
+    E: fmt::Display,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ClosureFailure(error) => write!(f, "map closure returned error: {}", error),
+            Self::ConflictingGuard => {
+                write!(f, "cannot map since a guard was protecting the memory")
+            }
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl<E> std::error::Error for TryMapError<E> where E: fmt::Debug + fmt::Display {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -904,11 +1051,34 @@ mod tests {
         guarded.guard_mut().unwrap().0 = true;
         assert_eq!(guarded.try_unguard(), Ok(Some(MyGuard(true))));
         assert_eq!(guarded.try_unguard(), Ok(None));
+
+        #[allow(unused_variables)]
+        let (static_ref_mut, _) = guarded.try_into_inner().unwrap();
+
+        #[cfg(miri)]
+        drop(unsafe { Box::from_raw(static_ref_mut) });
     }
 
     #[test]
     fn wrapping_string_literals() {
         // NOTE: We do not test the actual functionality, but the very ability not omit the types.
         let _: Guarded<NoGuard, _, _> = Guarded::wrap_static_slice(b"Hello there.");
+    }
+
+    #[test]
+    fn mapped_guard() {
+        let useless_text = b"This is highly important text.";
+
+        let mut guarded = Guarded::<NoGuard, _, marker::Exclusive>::new(vec![0u8; 2048]);
+        guarded.try_get_data_mut().unwrap()[..useless_text.len()].copy_from_slice(useless_text);
+        // TODO: Separate try_map_mut and map_mut, where map_mut only errors when there are
+        // conflicting guards.
+        let mapped = guarded
+            .try_map_mut(|vector| {
+                Result::<_, core::convert::Infallible>::Ok(&mut vector[..useless_text.len()])
+            })
+            .unwrap();
+
+        assert_eq!(mapped.try_get_data().unwrap(), useless_text);
     }
 }
