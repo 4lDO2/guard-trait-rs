@@ -10,6 +10,7 @@ repository = "https://github.com/4lDO2/guard-trait-rs"
 license = "MIT"
 keywords = ["memory-management", "io_uring"]
 categories = ["memory-management", "no-std"]
+exclude = ["target"]
 
 [features]
 default = ["std"]
