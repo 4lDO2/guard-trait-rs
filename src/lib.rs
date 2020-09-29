@@ -130,7 +130,7 @@ use core::mem::ManuallyDrop;
 use core::{fmt, mem, ops};
 
 pub extern crate stable_deref_trait;
-pub use stable_deref_trait::StableDeref;
+pub use stable_deref_trait::{CloneStableDeref, StableDeref};
 
 /// A module for markers, mainly intended to distinguish between shared (read-only) and exclusive
 /// (write capable) memory.
@@ -188,14 +188,13 @@ pub mod marker {
 // using epoch counts (`crossbeam-epoch`) or hazard pointers (`conc`), and whether there can be
 // integration between those systems and this trait.
 pub trait Guard {
-    /// Try to release the guard, returning either `true` if the memory could be reclaimed, or
-    /// `false` for failure.
+    /// Check the current external access to the memory protected by this guard.
     ///
     /// Note that this method is not expected to modify any state within the guard, but only the
     /// wrappers encapsulating it. This method should generally only _check_ whether the memory
     /// is no longer in use, and nothing else, which is the primary reason why it takes a `&self`
     /// reference and not `&mut self`.
-    fn try_release(&self) -> bool;
+    fn current_access(&self) -> Access;
 }
 
 impl<G> Guard for &mut G
@@ -203,9 +202,9 @@ where
     G: Guard,
 {
     #[inline]
-    fn try_release(&self) -> bool {
+    fn current_access(&self) -> Access {
         #[forbid(unconditional_recursion)]
-        G::try_release(self)
+        G::current_access(self)
     }
 }
 
@@ -214,9 +213,9 @@ where
     G: Guard,
 {
     #[inline]
-    fn try_release(&self) -> bool {
+    fn current_access(&self) -> Access {
         #[forbid(unconditional_recursion)]
-        G::try_release(self)
+        G::current_access(self)
     }
 }
 
@@ -228,7 +227,7 @@ where
 pub enum NoGuard {}
 
 impl Guard for NoGuard {
-    fn try_release(&self) -> bool {
+    fn current_access(&self) -> Access {
         unreachable!("NoGuard cannot be initialized")
     }
 }
@@ -401,7 +400,7 @@ where
             None => return Ok(None),
         };
 
-        if guard.try_release() {
+        if guard.current_access().is_none() {
             Ok(unsafe { self.unguard_unchecked() })
         } else {
             Err(TryUnguardError)
@@ -592,7 +591,59 @@ where
             Err(TryMapError::ConflictingGuard)
         }
     }
+
+    /// Take the guarded by reference, by taking both the inner data and the guard by reference.
+    #[inline]
+    pub fn by_ref<'anchor>(&'anchor self) -> Guarded<&'anchor G, &'anchor T, M> {
+        Guarded {
+            inner: ManuallyDrop::new(&*self.inner),
+            guard: self.guard.as_ref(),
+            _marker: PhantomData,
+        }
+    }
+    /// Take the guarded by a mutable reference, by taking both the inner data and the guard by
+    /// mutable reference.
+    #[inline]
+    pub fn by_ref_mut<'anchor>(&'anchor mut self) -> Guarded<&'anchor G, &'anchor mut T, M> {
+        Guarded {
+            inner: ManuallyDrop::new(&mut *self.inner),
+            guard: self.guard.as_ref(),
+            _marker: PhantomData,
+        }
+    }
 }
+
+impl<'guard, G, T, M> Guarded<&'guard G, T, M>
+where
+    G: Guard,
+    T: ops::Deref,
+    M: marker::Mode,
+{
+    /// Dereference the guard by cloning it.
+    ///
+    /// The guard must dereference into the same pointer when cloned, hence the [`CloneGuard`]
+    /// requirement. This has nothing to do with unsafe code and pointers, but rather the mere
+    /// necessity for the _same logical guard to be retrieved when dereferencing_. This makes sense
+    /// for smart pointers such as `Arc` and `Rc`, or other guards wrapping such pointers
+    /// internally.
+    #[inline]
+    pub fn with_cloned_guard(mut self) -> Guarded<G, T, M>
+    where
+        G: CloneGuard,
+    {
+        let inner = unsafe { ManuallyDrop::take(&mut self.inner) };
+        let guard = self.guard.take();
+
+        mem::forget(self);
+
+        Guarded {
+            inner: ManuallyDrop::new(inner),
+            guard: guard.cloned(),
+            _marker: PhantomData,
+        }
+    }
+}
+
 impl<G, T> Guarded<G, T, marker::Shared>
 where
     G: Guard,
@@ -767,6 +818,10 @@ where
     T: ops::Deref,
 {
 }
+
+/// A trait for guards that can be cloned, while retaining the exact same behavior.
+// TODO: Document this in detail.
+pub unsafe trait CloneGuard: Guard + Clone {}
 
 /// The base trait for types that are "guardable", meaning that they will leak on `Drop` unless
 /// they can remove their guard, that their memory cannot be read from if the kernel may mutate it,
@@ -1009,6 +1064,48 @@ where
     }
 }
 
+/// That ways in which memory can be accessed, namely shared or exclusive.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum Access {
+    /// The memory is accessed externally, but can only be read. It is therefore allowed for this
+    /// process to also immutably access the data.
+    Shared,
+    /// The memory is accessed externally, as read-write. This makes it impossible for this process
+    /// to access the memory, both immutably or mutably, since that can cause data races.
+    Exclusive,
+    /// The memory is not currently accessed at all, hence allowing the memory to be reclaimed.
+    None,
+}
+
+impl Access {
+    /// Check whether the access does not represent any pending external memory access.
+    #[inline]
+    pub fn is_none(self) -> bool {
+        self == Self::None
+    }
+    /// Check whether this enum represents any pending external memory access.
+    #[inline]
+    pub fn is_some(self) -> bool {
+        !self.is_none()
+    }
+}
+
+impl From<marker::Shared> for Access {
+    fn from(_: marker::Shared) -> Self {
+        Self::Shared
+    }
+}
+impl From<marker::Exclusive> for Access {
+    fn from(_: marker::Exclusive) -> Self {
+        Self::Exclusive
+    }
+}
+impl Default for Access {
+    fn default() -> Self {
+        Self::None
+    }
+}
+
 #[cfg(feature = "std")]
 impl<E> std::error::Error for TryMapError<E> where E: fmt::Debug + fmt::Display {}
 
@@ -1031,10 +1128,10 @@ mod tests {
         let static_ref_mut: &'static mut [u8] = Box::leak(STATIC_DATA.to_vec().into_boxed_slice());
 
         #[derive(Debug, Eq, PartialEq)]
-        struct MyGuard(bool);
+        struct MyGuard(Access);
 
         impl Guard for MyGuard {
-            fn try_release(&self) -> bool {
+            fn current_access(&self) -> Access {
                 self.0
             }
         }
@@ -1059,7 +1156,7 @@ mod tests {
         assert_ne!(guarded.as_mut_pointer_ptr(), ptr as *mut _);
         assert!(!guarded.has_guard());
 
-        guarded.guard(MyGuard(false));
+        guarded.guard(MyGuard(Access::Shared));
 
         assert_eq!(guarded.get_ref(), &copy[..]);
         assert_eq!(guarded.try_get_ref(), Some(&copy[..]));
@@ -1076,8 +1173,8 @@ mod tests {
         assert_ne!(guarded.as_mut_pointer_ptr(), ptr as *mut _);
 
         assert_eq!(guarded.try_unguard(), Err(TryUnguardError));
-        guarded.guard_mut().unwrap().0 = true;
-        assert_eq!(guarded.try_unguard(), Ok(Some(MyGuard(true))));
+        guarded.guard_mut().unwrap().0 = Access::None;
+        assert_eq!(guarded.try_unguard(), Ok(Some(MyGuard(Access::None))));
         assert_eq!(guarded.try_unguard(), Ok(None));
 
         #[allow(unused_variables)]
