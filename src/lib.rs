@@ -188,8 +188,36 @@ pub mod marker {
 // using epoch counts (`crossbeam-epoch`) or hazard pointers (`conc`), and whether there can be
 // integration between those systems and this trait.
 pub trait Guard {
-    /// Try to release the guard, returning either `true` if the memory could be reclaimed, or `false` for failure.
-    fn try_release(&mut self) -> bool;
+    /// Try to release the guard, returning either `true` if the memory could be reclaimed, or
+    /// `false` for failure.
+    ///
+    /// Note that this method is not expected to modify any state within the guard, but only the
+    /// wrappers encapsulating it. This method should generally only _check_ whether the memory
+    /// is no longer in use, and nothing else, which is the primary reason why it takes a `&self`
+    /// reference and not `&mut self`.
+    fn try_release(&self) -> bool;
+}
+
+impl<G> Guard for &mut G
+where
+    G: Guard,
+{
+    #[inline]
+    fn try_release(&self) -> bool {
+        #[forbid(unconditional_recursion)]
+        G::try_release(self)
+    }
+}
+
+impl<G> Guard for &G
+where
+    G: Guard,
+{
+    #[inline]
+    fn try_release(&self) -> bool {
+        #[forbid(unconditional_recursion)]
+        G::try_release(self)
+    }
 }
 
 /// A no-op guard, that cannot be initialized but still useful in type contexts. This the
@@ -200,7 +228,7 @@ pub trait Guard {
 pub enum NoGuard {}
 
 impl Guard for NoGuard {
-    fn try_release(&mut self) -> bool {
+    fn try_release(&self) -> bool {
         unreachable!("NoGuard cannot be initialized")
     }
 }
@@ -1006,7 +1034,7 @@ mod tests {
         struct MyGuard(bool);
 
         impl Guard for MyGuard {
-            fn try_release(&mut self) -> bool {
+            fn try_release(&self) -> bool {
                 self.0
             }
         }
