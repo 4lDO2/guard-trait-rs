@@ -591,26 +591,6 @@ where
             Err(TryMapError::ConflictingGuard)
         }
     }
-
-    /// Take the guarded by reference, by taking both the inner data and the guard by reference.
-    #[inline]
-    pub fn by_ref<'anchor>(&'anchor self) -> Guarded<&'anchor G, &'anchor T, M> {
-        Guarded {
-            inner: ManuallyDrop::new(&*self.inner),
-            guard: self.guard.as_ref(),
-            _marker: PhantomData,
-        }
-    }
-    /// Take the guarded by a mutable reference, by taking both the inner data and the guard by
-    /// mutable reference.
-    #[inline]
-    pub fn by_ref_mut<'anchor>(&'anchor mut self) -> Guarded<&'anchor G, &'anchor mut T, M> {
-        Guarded {
-            inner: ManuallyDrop::new(&mut *self.inner),
-            guard: self.guard.as_ref(),
-            _marker: PhantomData,
-        }
-    }
 }
 
 impl<'guard, G, T, M> Guarded<&'guard G, T, M>
