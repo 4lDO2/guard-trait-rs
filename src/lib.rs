@@ -593,37 +593,6 @@ where
     }
 }
 
-impl<'guard, G, T, M> Guarded<&'guard G, T, M>
-where
-    G: Guard,
-    T: ops::Deref,
-    M: marker::Mode,
-{
-    /// Dereference the guard by cloning it.
-    ///
-    /// The guard must dereference into the same pointer when cloned, hence the [`CloneGuard`]
-    /// requirement. This has nothing to do with unsafe code and pointers, but rather the mere
-    /// necessity for the _same logical guard to be retrieved when dereferencing_. This makes sense
-    /// for smart pointers such as `Arc` and `Rc`, or other guards wrapping such pointers
-    /// internally.
-    #[inline]
-    pub fn with_cloned_guard(mut self) -> Guarded<G, T, M>
-    where
-        G: CloneGuard,
-    {
-        let inner = unsafe { ManuallyDrop::take(&mut self.inner) };
-        let guard = self.guard.take();
-
-        mem::forget(self);
-
-        Guarded {
-            inner: ManuallyDrop::new(inner),
-            guard: guard.cloned(),
-            _marker: PhantomData,
-        }
-    }
-}
-
 impl<G, T> Guarded<G, T, marker::Shared>
 where
     G: Guard,
@@ -855,6 +824,22 @@ where
     ///
     /// [`try_get_data_mut`]: ./trait.GuardableExclusive.html#tymethod.try_get_data_mut
     fn try_get_data(&self) -> Option<&T>;
+
+    /// Get a reference to the inner data, regardless of whether a guard is protecting it or not.
+    ///
+    /// # Safety
+    ///
+    /// Since the memory guarding system allows externally borrowing references, the caller must
+    /// ensure that the reference is not externally borrowed while this is called, since that could
+    /// cause UB. This method is only intended to retrieve a one-time reference that is likely
+    /// later going to be turned into a pointer and passed to a system call or other interface.
+    ///
+    /// __NOTE: Use [`get_data_unchecked_mut`] for mutable access; Rust forbids upgrading regular
+    /// references unless `UnsafeCell` is used.__
+    unsafe fn get_data_unchecked(&self) -> &T;
+
+    /// Check whether the guardable has an active guard.
+    fn has_guard(&self) -> bool;
 }
 
 /// A trait for guardable types, that are aliasable and immutable. This trait is primarily focused
@@ -875,7 +860,8 @@ where
     G: Guard,
     T: ?Sized,
 {
-    /// Retrieve the inner aliasable data that this guardable points to.
+    /// Retrieve the inner aliasable data that this guardable points to. This will always suceed,
+    /// since [`GuardableShared`] prevents access to the inner data.
     fn data_shared(&self) -> &T;
 }
 /// A trait for guardable types, that are also non-aliasable (while there is a guard), and mutable.
@@ -900,6 +886,14 @@ where
     // additional guarantees.
     /// Attempt to retrieve the inner mutable data, so long as there is not a guard.
     fn try_get_data_mut(&mut self) -> Option<&mut T>;
+
+    /// Get a mutable reference to the inner data, regardless of whether a guard is protecting it
+    /// or not.
+    ///
+    /// # Safety
+    ///
+    /// The safety invariants are described in [`get_data_unchecked`].
+    unsafe fn get_data_unchecked_mut(&mut self) -> &mut T;
 }
 
 unsafe impl<G, T, M, U> Guardable<G, U> for Guarded<G, T, M>
@@ -920,6 +914,14 @@ where
     #[inline]
     fn try_get_data(&self) -> Option<&U> {
         self.try_get_ref()
+    }
+    #[inline]
+    unsafe fn get_data_unchecked(&self) -> &U {
+        self.get_unchecked_ref()
+    }
+    #[inline]
+    fn has_guard(&self) -> bool {
+        self.guard.is_some()
     }
 }
 unsafe impl<G, T, U> GuardableShared<G, U> for Guarded<G, T, marker::Shared>
@@ -942,6 +944,10 @@ where
     #[inline]
     fn try_get_data_mut(&mut self) -> Option<&mut U> {
         self.try_get_mut()
+    }
+    #[inline]
+    unsafe fn get_data_unchecked_mut(&mut self) -> &mut U {
+        self.get_unchecked_mut()
     }
 }
 
@@ -990,6 +996,14 @@ where
             Some(unsafe { &*self.mapped })
         }
     }
+    #[inline]
+    unsafe fn get_data_unchecked(&self) -> &U {
+        &*self.mapped
+    }
+    #[inline]
+    fn has_guard(&self) -> bool {
+        self.inner.has_guard()
+    }
 }
 unsafe impl<G, T, U> GuardableShared<G, U> for MappedGuarded<G, T, marker::Shared, U>
 where
@@ -1015,6 +1029,10 @@ where
         } else {
             Some(unsafe { &mut *self.mapped })
         }
+    }
+    #[inline]
+    unsafe fn get_data_unchecked_mut(&mut self) -> &mut U {
+        &mut *self.mapped
     }
 }
 
