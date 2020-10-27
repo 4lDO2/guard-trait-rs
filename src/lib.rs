@@ -350,3 +350,30 @@ where
 // TODO: Dynamically tracked "anchors" that allow referenced with lifetimes, with the cost of some
 // extra runtime tracking, to prevent dropped or leaked referenced from doing harm. This would be
 // similar to what the old API did.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn basic_types_implement_guarded() {
+        use std::sync::Arc;
+        use std::rc::Rc;
+
+        fn does_impl_guarded<T: Guarded>() {}
+        fn does_impl_guarded_mut<T: GuardedMut>() {}
+
+        does_impl_guarded::<Arc<[u8]>>();
+        does_impl_guarded::<Rc<[u8]>>();
+        does_impl_guarded::<Box<[u8]>>();
+        does_impl_guarded::<Vec<u8>>();
+        does_impl_guarded::<&'static [u8]>();
+        does_impl_guarded::<&'static mut [u8]>();
+        does_impl_guarded::<&'static str>();
+        does_impl_guarded::<String>();
+
+        does_impl_guarded_mut::<Box<[u8]>>();
+        does_impl_guarded_mut::<Vec<u8>>();
+        does_impl_guarded::<&'static mut [u8]>();
+    }
+}
