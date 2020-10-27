@@ -154,9 +154,7 @@ where
     ///   cancelled _at any time_, with the original borrowed data accessible again.
     #[inline]
     pub unsafe fn new_unchecked(inner: T) -> Self {
-        Self {
-            inner,
-        }
+        Self { inner }
     }
 }
 unsafe impl<T, U> Guarded for AssertSafe<T>
@@ -276,7 +274,7 @@ where
     // reference is mutable, allowing Subtype to be replaced with Supertype.
     //
     // The regular Mapped wrapper only deals with immutable references, and is thus covariant.
-    // 
+    //
     // See [the nomicon](https://doc.rust-lang.org/nomicon/subtyping.html).
     _invariance: PhantomData<*mut U>,
 }
@@ -357,8 +355,8 @@ mod tests {
 
     #[test]
     fn basic_types_implement_guarded() {
-        use std::sync::Arc;
         use std::rc::Rc;
+        use std::sync::Arc;
 
         fn does_impl_guarded<T: Guarded>() {}
         fn does_impl_guarded_mut<T: GuardedMut>() {}
