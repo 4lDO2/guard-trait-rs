@@ -1,9 +1,9 @@
 [package]
 name = "guard-trait"
-version = "0.2.1"
+version = "0.3.0"
 authors = ["4lDO2 <4lDO2@protonmail.com>"]
 edition = "2018"
-description = "Contains wrappers that allow memory to be protected using a guard, used mostly for safe io_uring memory abstractions."
+description = "Contains fundamental wrappers for pointer types that can safely be shared in memory-sharing completion-based I/O interfaces"
 documentation = "https://docs.rs/guard-trait"
 readme = "README.md"
 repository = "https://github.com/4lDO2/guard-trait-rs"
