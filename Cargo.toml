@@ -1,6 +1,6 @@
 [package]
 name = "guard-trait"
-version = "0.3.0"
+version = "0.4.0"
 authors = ["4lDO2 <4lDO2@protonmail.com>"]
 edition = "2018"
 description = "Contains fundamental wrappers for pointer types that can safely be shared in memory-sharing completion-based I/O interfaces"
