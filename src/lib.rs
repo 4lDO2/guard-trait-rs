@@ -244,6 +244,18 @@ where
             inner: self.inner,
         }
     }
+    /// Attempt to map the reference again, but with the ability to short-circuit on errors.
+    #[inline]
+    pub fn try_and_then<F, V, E>(self, f: F) -> Result<Mapped<T, V>, E>
+    where
+        F: FnOnce(&U) -> Result<&V, E>,
+        V: ?Sized,
+    {
+        Ok(Mapped {
+            mapped: f(self.get_ref())?.into(),
+            inner: self.inner,
+        })
+    }
 }
 impl<T, U> fmt::Debug for Mapped<T, U>
 where
@@ -336,6 +348,21 @@ where
             _invariance: PhantomData,
         }
     }
+
+    /// Attempt to map the reference again, but with the ability to short-circuit on errors.
+    #[inline]
+    pub fn try_and_then<F, V, E>(mut self, f: F) -> Result<MappedMut<T, V>, E>
+    where
+        F: FnOnce(&mut U) -> Result<&mut V, E>,
+        V: ?Sized,
+    {
+        Ok(MappedMut {
+            mapped: f(self.get_mut())?.into(),
+            inner: self.inner,
+
+            _invariance: PhantomData,
+        })
+    }
 }
 
 unsafe impl<T, U> Guarded for MappedMut<T, U>
@@ -391,6 +418,21 @@ pub trait GuardedExt: private::Sealed + Guarded + Sized {
             inner: this,
         }
     }
+    /// Apply a fallible function to the pointee, creating a new guarded type that dereferences
+    /// into the result of that function.
+    ///
+    /// If the function fails, the error is returned directly, and no further mapping is made.
+    #[inline]
+    fn try_map<F, T, E>(this: Self, f: F) -> Result<Mapped<Self, T>, E>
+    where
+        F: FnOnce(&<Self as Guarded>::Target) -> Result<&T, E>,
+        T: ?Sized,
+    {
+        Ok(Mapped {
+            mapped: f(this.borrow_guarded())?.into(),
+            inner: this,
+        })
+    }
 }
 /// An extension trait for convenience methods, that is automatically implemented for all
 /// [`GuardedMut`] types.
@@ -411,6 +453,22 @@ pub trait GuardedMutExt: private::Sealed + GuardedMut + Sized {
             inner: this,
             _invariance: PhantomData,
         }
+    }
+    /// Apply a fallible function to the pointee, creating a new guarded type that dereferences
+    /// into the result of that function.
+    ///
+    /// If the function fails, the error is returned directly, and no further mapping is made.
+    #[inline]
+    fn try_map_mut<F, T, E>(mut this: Self, f: F) -> Result<MappedMut<Self, T>, E>
+    where
+        F: FnOnce(&mut <Self as Guarded>::Target) -> Result<&mut T, E>,
+        T: ?Sized,
+    {
+        Ok(MappedMut {
+            mapped: f(this.borrow_guarded_mut())?.into(),
+            inner: this,
+            _invariance: PhantomData,
+        })
     }
 }
 impl<T> private::Sealed for T
@@ -475,6 +533,6 @@ mod tests {
         assert!(buf[..128].iter().copied().all(|byte| byte == 0x00));
         assert!(buf[128..192].iter().copied().all(|byte| byte == 0xFF));
         assert!(buf[192..].iter().copied().all(|byte| byte == 0x00));
-
     }
+    // TODO: try_and_then, etc
 }
