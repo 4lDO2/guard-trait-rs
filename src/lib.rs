@@ -68,7 +68,21 @@
 //! challenges.
 //!
 //! # Interface
-//! TODO
+//!
+//! The way `guard_trait` solves this, is by adding two simple traits: `Guarded` and `GuardedMut`.
+//! `Guarded` is automatically implemented for every pointer type that implements `Deref`,
+//! `StableDeref` and `'static`. Similarly, `GuardedMut` is implemented under the same conditions,
+//! and provided that the pointer implements `DerefMut`. A consequence of this, is that nearly all
+//! owned container types, such as `Arc`, `Box`, `Vec`, etc., all implement the traits, and can
+//! thus be used with completion-based interfaces.
+//!
+//! For scenarios where it is impossible to ensure at the type level, that a certain pointer
+//! follows the guard invariants, `AssertSafe` also exists, but is unsafe to initialize.
+//!
+//! Buffers can also be mapped in a self-referencial way, similar to how `owning-ref` works, using
+//! `GuardedExt::map` and `GuardedMutExt::map_mut`. This is especially important when slice
+//! indexing is needed, as the only way to limit the number of bytes to do I/O with, generally is
+//! to shorten the slice.
 
 #![deny(broken_intra_doc_links, missing_docs)]
 #![cfg_attr(not(any(test, feature = "std")), no_std)]
@@ -220,13 +234,14 @@ where
     }
     /// Map the mapped wrapper again, converting `&U` to `&V`.
     #[inline]
-    pub fn map<F, V>(this: Mapped<T, U>, f: F) -> Mapped<T, V>
+    pub fn and_then<F, V>(self, f: F) -> Mapped<T, V>
     where
         F: FnOnce(&U) -> &V,
+        V: ?Sized,
     {
         Mapped {
-            mapped: f(this.get_ref()).into(),
-            inner: this.inner,
+            mapped: f(self.get_ref()).into(),
+            inner: self.inner,
         }
     }
 }
@@ -309,13 +324,14 @@ where
     }
     /// Map the mapped reference again, converting `&mut U` to `&mut V`.
     #[inline]
-    pub fn map<F, V>(mut this: MappedMut<T, U>, f: F) -> MappedMut<T, V>
+    pub fn and_then<F, V>(mut self, f: F) -> MappedMut<T, V>
     where
         F: FnOnce(&mut U) -> &mut V,
+        V: ?Sized,
     {
         MappedMut {
-            mapped: f(this.get_mut()).into(),
-            inner: this.inner,
+            mapped: f(self.get_mut()).into(),
+            inner: self.inner,
 
             _invariance: PhantomData,
         }
@@ -349,6 +365,73 @@ where
 // extra runtime tracking, to prevent dropped or leaked referenced from doing harm. This would be
 // similar to what the old API did.
 
+// TODO: Support mapped types that map into a borrowing _object_, rather than a plain reference.
+// It's not entirely clear what owning_ref does wrong there, but consider [this
+// issue](https://github.com/Kimundi/owning-ref-rs/issues/49).
+
+mod private {
+    pub trait Sealed {}
+}
+/// An extension trait for convenience methods, that is automatically implemented for all
+/// [`Guarded`] types.
+pub trait GuardedExt: private::Sealed + Guarded + Sized {
+    /// Apply a function to the pointee, creating a new guarded type that dereferences into the
+    /// result of that function.
+    ///
+    /// The closure is only evaluated once, and the resulting wrapper will only store one
+    /// null-optimizable additional word, for the reference.
+    #[inline]
+    fn map<F, T>(this: Self, f: F) -> Mapped<Self, T>
+    where
+        F: FnOnce(&<Self as Guarded>::Target) -> &T,
+        T: ?Sized,
+    {
+        Mapped {
+            mapped: f(this.borrow_guarded()).into(),
+            inner: this,
+        }
+    }
+}
+/// An extension trait for convenience methods, that is automatically implemented for all
+/// [`GuardedMut`] types.
+pub trait GuardedMutExt: private::Sealed + GuardedMut + Sized {
+    /// Apply a function to the pointee, creating a new guarded type that dereferences into the
+    /// result of that function.
+    ///
+    /// This is the mutable version of [`GuardedExt::map`]. Because of this mutability, the
+    /// original pointer cannot be accessed until it is completely moved out of the wrapper.
+    #[inline]
+    fn map_mut<F, T>(mut this: Self, f: F) -> MappedMut<Self, T>
+    where
+        F: FnOnce(&mut <Self as Guarded>::Target) -> &mut T,
+        T: ?Sized,
+    {
+        MappedMut {
+            mapped: f(this.borrow_guarded_mut()).into(),
+            inner: this,
+            _invariance: PhantomData,
+        }
+    }
+}
+impl<T> private::Sealed for T
+where
+    T: Guarded + Sized,
+{
+}
+impl<T> GuardedExt for T
+where
+    T: Guarded + Sized,
+{
+}
+impl<T> GuardedMutExt for T
+where
+    T: GuardedMut + Sized,
+{
+}
+
+// TODO: Perhaps an additional extension trait that allows indexing and slicing pointers to slice
+// types?
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -373,5 +456,25 @@ mod tests {
         does_impl_guarded_mut::<Box<[u8]>>();
         does_impl_guarded_mut::<Vec<u8>>();
         does_impl_guarded::<&'static mut [u8]>();
+    }
+
+    #[test]
+    fn mapped() {
+        let mut buf = vec! [0x00_u8; 256];
+
+        let sub_buf = GuardedMutExt::map_mut(buf, |buf: &mut [u8]| -> &mut [u8] {
+            &mut buf[128..]
+        });
+        let mut subsub_buf = sub_buf.and_then(|buf| &mut buf[..64]);
+
+        for byte in subsub_buf.borrow_guarded_mut() {
+            *byte = 0xFF;
+        }
+        buf = subsub_buf.into_original();
+
+        assert!(buf[..128].iter().copied().all(|byte| byte == 0x00));
+        assert!(buf[128..192].iter().copied().all(|byte| byte == 0xFF));
+        assert!(buf[192..].iter().copied().all(|byte| byte == 0x00));
+
     }
 }
